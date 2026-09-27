@@ -24,15 +24,19 @@
 #define DEFAULT_RAW_RECVMBOX_SIZE 128
 #define DEFAULT_ACCEPTMBOX_SIZE 128
 
-// Debugging options
-#define LWIP_DEBUG 1
-#define ETHARP_DEBUG LWIP_DBG_ON
-#define NETIF_DEBUG LWIP_DBG_ON
-#define ICMP_DEBUG LWIP_DBG_ON
-#define IP_DEBUG LWIP_DBG_ON
-#define TCPIP_DEBUG LWIP_DBG_ON
-#define UDP_DEBUG LWIP_DBG_ON
-#define INET_DEBUG LWIP_DBG_ON
-#define IP_REASS_DEBUG LWIP_DBG_ON
+// Debugging options — DISABLED for streaming performance!
+// When LWIP_DEBUG is enabled, every udp_sendto() triggers ~13 blocking
+// tm_printf() calls over UART. At 94 packets/frame, that's ~1222 serial
+// prints per frame, causing a 7+ second UART stall and dropping FPS to 0.1.
+// Re-enable temporarily only when debugging lwIP protocol issues.
+// #define LWIP_DEBUG 1
+// #define ETHARP_DEBUG LWIP_DBG_ON
+// #define NETIF_DEBUG LWIP_DBG_ON
+// #define ICMP_DEBUG LWIP_DBG_ON
+// #define IP_DEBUG LWIP_DBG_ON
+// #define TCPIP_DEBUG LWIP_DBG_ON
+// #define UDP_DEBUG LWIP_DBG_ON
+// #define INET_DEBUG LWIP_DBG_ON
+// #define IP_REASS_DEBUG LWIP_DBG_ON
 
 #endif /* __LWIPOPTS_H__ */

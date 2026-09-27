@@ -736,7 +736,7 @@ static struct pbuf *low_level_input(struct netif *netif) {
   if (HAL_ETH_ReadData(&heth1, &appBuff) == HAL_OK) {
     uint32_t framelength = heth1.RxDescList[heth1.RxOpCH].RxDataLength;
 
-    if (framelength > 0 && appBuff != NULL) {
+    if (framelength > 0 && framelength <= 1514 && appBuff != NULL) {
       g_rx_pkt_count++;
 
       /* Allocate LwIP memory */

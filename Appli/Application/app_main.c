@@ -14,6 +14,7 @@
 
 #include "app_camera.h"
 #include "app_od.h"
+#include "app_camera_ethernet_test.h"
 
 struct netif gnetif;
 
@@ -106,7 +107,9 @@ LOCAL void net_task(INT stacd, void *exinf)
     PRINT("[NET] Static IP  : 192.168.1.10\r\n");
     PRINT("[NET] Netmask    : 255.255.255.0\r\n");
     PRINT("[NET] Gateway    : 192.168.1.1\r\n");
-    PRINT("[NET] Broadcasting test frames every 1s (check Wireshark!)\r\n");
+
+    /* Initialize Video + Telemetry Ethernet Streamer */
+    Ethernet_Streamer_Init();
 
     uint32_t heartbeat_timer = 0;
     uint32_t heartbeat_sec = 0;

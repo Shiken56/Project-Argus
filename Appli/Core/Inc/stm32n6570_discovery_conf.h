@@ -35,7 +35,7 @@ extern "C" {
 #define USE_BSP_COM_FEATURE                 1U
 
 /* XSPI memories defines */
-#define USE_NOR_MEMORY_MX66UW1G45G          0U
+#define USE_NOR_MEMORY_MX66UW1G45G          1U
 #define USE_RAM_MEMORY_APS256XX              1U
 
 /* Touch Sensing controller defines */

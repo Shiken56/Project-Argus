@@ -2,6 +2,7 @@
 #include "app_camerapipeline.h"
 #include "cmw_camera.h"
 #include "stm32n6xx_hal.h"
+#include "app_camera_ethernet_test.h"
 #include <tm/tmonitor.h>
 
 #define PRINT(fmt, ...) tm_printf((const UB *)(fmt), ##__VA_ARGS__)
@@ -14,8 +15,7 @@ ID sem_camera_pipe0_ready;
 
 /* Allocate RAM buffer for the camera DMA (aligned for 32-byte cache line ops)
  */
-__attribute__((aligned(32))) __attribute__((
-    section(".psram_bss"))) uint8_t ml_buffer[ML_WIDTH * ML_HEIGHT * 3];
+__attribute__((aligned(32))) uint8_t ml_buffer[ML_WIDTH * ML_HEIGHT * 3];
 
 __attribute__((aligned(32))) __attribute__((
     section(".psram_bss"))) uint8_t display_buffer[800 * 480 * 2];
@@ -70,9 +70,9 @@ void camera_task(INT stacd, void *exinf) {
   }
 
   /* Initialize UDP Video Streamer */
-  PRINT("[CAMERA] Initializing UDP Streamer...\r\n");
-  #include "app_camera_ethernet_test.h"
-  Ethernet_Streamer_Init();
+  // PRINT("[CAMERA] Initializing UDP Streamer...\r\n");
+  // #include "app_camera_ethernet_test.h"
+  // Ethernet_Streamer_Init();
 
   uint32_t lcd_bg_width, lcd_bg_height, pitch_nn;
   PRINT("[CAMERA] Initializing Camera Pipeline (reference "
@@ -131,8 +131,8 @@ void camera_task(INT stacd, void *exinf) {
     SCB_InvalidateDCache_by_Addr((uint32_t *)ml_buffer, sizeof(ml_buffer));
     SCB_InvalidateDCache_by_Addr((uint32_t *)display_buffer, sizeof(display_buffer));
 
-    /* Send frame over Ethernet (256x256 RGB888) */
-    Ethernet_Streamer_SendFrame(ml_buffer, ML_WIDTH, ML_HEIGHT, 3);
+    /* Send frame over Ethernet at camera frame rate (256x256 RGB888 -> RGB565) */
+    Ethernet_Streamer_SendVideoFrame(ml_buffer, ML_WIDTH, ML_HEIGHT, 3, frame_count);
 
     extern ID sem_od_frame_ready;
     if (sem_od_frame_ready > 0) {

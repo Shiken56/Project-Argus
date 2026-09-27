@@ -631,6 +631,69 @@ void HAL_I2C_MspDeInit(I2C_HandleTypeDef* hi2c)
 }
 
 /**
+  * @brief RAMCFG MSP Initialization
+  * This function configures the hardware resources used in this example
+  * @param hramcfg: RAMCFG handle pointer
+  * @retval None
+  */
+void HAL_RAMCFG_MspInit(RAMCFG_HandleTypeDef* hramcfg)
+{
+    /* USER CODE BEGIN RAMCFG_MspInit 0 */
+
+    /* USER CODE END RAMCFG_MspInit 0 */
+    /* Peripheral clock enable */
+    __HAL_RCC_RAMCFG_CLK_ENABLE();
+    if (hramcfg->Instance == RAMCFG_SRAM3_AXI)
+    {
+      __HAL_RCC_AXISRAM3_MEM_CLK_ENABLE();
+
+      HAL_RAMCFG_EnableAXISRAM(hramcfg);
+    }
+    else if (hramcfg->Instance == RAMCFG_SRAM4_AXI)
+    {
+      __HAL_RCC_AXISRAM4_MEM_CLK_ENABLE();
+
+      HAL_RAMCFG_EnableAXISRAM(hramcfg);
+    }
+    else if (hramcfg->Instance == RAMCFG_SRAM5_AXI)
+    {
+      __HAL_RCC_AXISRAM5_MEM_CLK_ENABLE();
+
+      HAL_RAMCFG_EnableAXISRAM(hramcfg);
+    }
+    else if (hramcfg->Instance == RAMCFG_SRAM6_AXI)
+    {
+      __HAL_RCC_AXISRAM6_MEM_CLK_ENABLE();
+
+      HAL_RAMCFG_EnableAXISRAM(hramcfg);
+    }
+
+    /* USER CODE BEGIN RAMCFG_MspInit 1 */
+
+    /* USER CODE END RAMCFG_MspInit 1 */
+
+}
+
+/**
+  * @brief RAMCFG MSP De-Initialization
+  * This function freeze the hardware resources used in this example
+  * @param hramcfg: RAMCFG handle pointer
+  * @retval None
+  */
+void HAL_RAMCFG_MspDeInit(RAMCFG_HandleTypeDef* hramcfg)
+{
+    /* USER CODE BEGIN RAMCFG_MspDeInit 0 */
+
+    /* USER CODE END RAMCFG_MspDeInit 0 */
+    /* Peripheral clock disable */
+    __HAL_RCC_RAMCFG_CLK_DISABLE();
+    /* USER CODE BEGIN RAMCFG_MspDeInit 1 */
+
+    /* USER CODE END RAMCFG_MspDeInit 1 */
+
+}
+
+/**
   * @brief UART MSP Initialization
   * This function configures the hardware resources used in this example
   * @param huart: UART handle pointer

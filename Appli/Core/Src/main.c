@@ -71,6 +71,11 @@ ETH_HandleTypeDef heth1;
 
 I2C_HandleTypeDef hi2c1;
 
+RAMCFG_HandleTypeDef hramcfg_SRAM3;
+RAMCFG_HandleTypeDef hramcfg_SRAM4;
+RAMCFG_HandleTypeDef hramcfg_SRAM5;
+RAMCFG_HandleTypeDef hramcfg_SRAM6;
+
 UART_HandleTypeDef huart1;
 
 XSPI_HandleTypeDef hxspi1;
@@ -90,6 +95,7 @@ static void MX_USART1_UART_Init(void);
 static void MX_DCMIPP_Init(void);
 static void MX_XSPI1_Init(void);
 static void MX_CACHEAXI_Init(void);
+static void MX_RAMCFG_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -142,6 +148,7 @@ int main(void)
   MX_DCMIPP_Init();
   MX_XSPI1_Init();
   MX_CACHEAXI_Init();
+  MX_RAMCFG_Init();
   /* USER CODE BEGIN 2 */
   /* Initialize the External PSRAM (HyperRAM) on XSPI1 */
   if (BSP_XSPI_RAM_Init(0) != 0)
@@ -515,6 +522,63 @@ static void MX_I2C1_Init(void)
   /* USER CODE BEGIN I2C1_Init 2 */
 
   /* USER CODE END I2C1_Init 2 */
+
+}
+
+/**
+  * @brief RAMCFG Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_RAMCFG_Init(void)
+{
+
+  /* USER CODE BEGIN RAMCFG_Init 0 */
+
+  /* USER CODE END RAMCFG_Init 0 */
+
+  /* USER CODE BEGIN RAMCFG_Init 1 */
+
+  /* USER CODE END RAMCFG_Init 1 */
+
+  /** Initialize RAMCFG SRAM3
+  */
+  hramcfg_SRAM3.Instance = RAMCFG_SRAM3_AXI;
+  if (HAL_RAMCFG_Init(&hramcfg_SRAM3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  HAL_RAMCFG_EnableAXISRAM(&hramcfg_SRAM3);
+
+  /** Initialize RAMCFG SRAM4
+  */
+  hramcfg_SRAM4.Instance = RAMCFG_SRAM4_AXI;
+  if (HAL_RAMCFG_Init(&hramcfg_SRAM4) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  HAL_RAMCFG_EnableAXISRAM(&hramcfg_SRAM4);
+
+  /** Initialize RAMCFG SRAM5
+  */
+  hramcfg_SRAM5.Instance = RAMCFG_SRAM5_AXI;
+  if (HAL_RAMCFG_Init(&hramcfg_SRAM5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  HAL_RAMCFG_EnableAXISRAM(&hramcfg_SRAM5);
+
+  /** Initialize RAMCFG SRAM6
+  */
+  hramcfg_SRAM6.Instance = RAMCFG_SRAM6_AXI;
+  if (HAL_RAMCFG_Init(&hramcfg_SRAM6) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  HAL_RAMCFG_EnableAXISRAM(&hramcfg_SRAM6);
+  /* USER CODE BEGIN RAMCFG_Init 2 */
+
+  /* USER CODE END RAMCFG_Init 2 */
 
 }
 

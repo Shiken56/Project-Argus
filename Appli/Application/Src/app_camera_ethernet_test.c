@@ -6,125 +6,213 @@
 
 #undef _B
 #include <tk/tkernel.h>
+#include <tm/tmonitor.h>
 
-/* ========================================== */
-/* CHANGE THIS TO YOUR LAPTOP'S ETHERNET IP   */
-/* ========================================== */
+#define PRINT(fmt, ...) tm_printf((const UB *)(fmt), ##__VA_ARGS__)
+
+/* ========================================================================= */
+/* CONFIGURATION: LAPTOP / PC ETHERNET DESTINATION                           */
+/* ========================================================================= */
 #define PC_IP_1 192
 #define PC_IP_2 168
 #define PC_IP_3 1
 #define PC_IP_4 100
 
 #define TARGET_PORT 5000
-#define UDP_CHUNK_SIZE 1024
+#define UDP_CHUNK_PAYLOAD_SIZE 1400
 
-static struct udp_pcb *udp_pcb = NULL;
+static struct udp_pcb *stream_pcb = NULL;
 static ip_addr_t target_ip;
-static ID sem_ethernet_ready = 0;
+static ID sem_stream_ready = 0;
 
-/* Global state for the task */
-static uint8_t *g_frame_buffer = NULL;
-static uint32_t g_width = 0;
-static uint32_t g_height = 0;
-static uint8_t  g_bpp = 0;
+/* Double Buffers in PSRAM for 256x256 RGB565 streaming (avoids internal SRAM collision with 0x34100000) */
+static __attribute__((aligned(32))) __attribute__((section(".psram_bss"))) uint16_t s_rgb565_stream_buf[2][256 * 256];
+static volatile uint8_t s_active_read_buf = 0;
+static volatile bool s_stream_busy = false;
+static uint32_t s_frame_bytes[2] = {0, 0};
+static uint32_t s_stream_frame_id[2] = {0, 0};
 
-#pragma pack(push, 1)
-typedef struct {
-    uint32_t frame_id;
-    uint16_t chunk_idx;
-    uint16_t total_chunks;
-} UdpHeader_t;
-#pragma pack(pop)
+/* Shared detection metadata (updated by OD task, transmitted by Streamer task) */
+static OdMetadataPacket_t s_meta_pkt;
 
-/* The Dedicated Ethernet Background Task */
-static void ethernet_task(INT stacd, void *exinf) {
-    static uint32_t frame_counter = 0;
-    static uint16_t next_chunk = 0;
+static inline void convert_rgb888_to_rgb565(const uint8_t *src, uint16_t *dst, uint32_t num_pixels) {
+    for (uint32_t i = 0; i < num_pixels; i++) {
+        uint8_t r = src[i * 3 + 0];
+        uint8_t g = src[i * 3 + 1];
+        uint8_t b = src[i * 3 + 2];
+        dst[i] = (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
+    }
+}
 
-    while(1) {
-        /* Sleep until the Camera Task triggers us */
-        tk_wai_sem(sem_ethernet_ready, 1, TMO_FEVR);
+/* Dedicated Background RTOS Ethernet Streaming Task (Priority 11) */
+static void ethernet_stream_task(INT stacd, void *exinf) {
+    (void)stacd;
+    (void)exinf;
 
-        if (udp_pcb == NULL || g_frame_buffer == NULL) continue;
+    PRINT("[ETH STREAM] Decoupled Streamer Task started (Priority 11)...\r\n");
 
-        frame_counter++;
-        static uint16_t next_chunk = 0;
-        uint32_t total_bytes = g_width * g_height * g_bpp;
-        uint16_t total_chunks = (total_bytes + UDP_CHUNK_SIZE - 1) / UDP_CHUNK_SIZE;
+    while (1) {
+        /* Sleep until camera task signals a new frame */
+        ER err = tk_wai_sem(sem_stream_ready, 1, TMO_FEVR);
+        if (err != E_OK) continue;
 
-        /* Send EXACTLY 3 chunks per wake-up. 
-           The hardware MAC usually has 4 TX descriptors. If we send more than 3, 
-           HAL_ETH_Transmit blocks and forces a 79ms RTOS timeout delay! */
-        uint16_t chunks_to_send = 3;
-        
-        for (uint16_t i = 0; i < chunks_to_send; i++) {
-            uint32_t offset = next_chunk * UDP_CHUNK_SIZE;
-            uint32_t chunk_len = UDP_CHUNK_SIZE;
+        if (stream_pcb == NULL) {
+            s_stream_busy = false;
+            continue;
+        }
+
+        uint8_t r_idx = s_active_read_buf;
+        const uint8_t *frame_data = (const uint8_t *)s_rgb565_stream_buf[r_idx];
+        uint32_t total_bytes = s_frame_bytes[r_idx];
+        uint32_t frame_id = s_stream_frame_id[r_idx];
+
+        /* 1. Transmit Metadata Packet with current detection state */
+        struct pbuf *p_meta = pbuf_alloc(PBUF_TRANSPORT, sizeof(OdMetadataPacket_t), PBUF_RAM);
+        if (p_meta != NULL) {
+            OdMetadataPacket_t meta_copy;
+            memcpy(&meta_copy, &s_meta_pkt, sizeof(OdMetadataPacket_t));
+            meta_copy.frame_id = frame_id;
+            memcpy(p_meta->payload, &meta_copy, sizeof(OdMetadataPacket_t));
+            udp_sendto(stream_pcb, p_meta, &target_ip, TARGET_PORT);
+            pbuf_free(p_meta);
+        }
+
+        /* 2. Transmit Video Chunks */
+        uint16_t total_chunks = (total_bytes + UDP_CHUNK_PAYLOAD_SIZE - 1) / UDP_CHUNK_PAYLOAD_SIZE;
+
+        for (uint16_t c = 0; c < total_chunks; c++) {
+            uint32_t offset = c * UDP_CHUNK_PAYLOAD_SIZE;
+            uint16_t chunk_len = UDP_CHUNK_PAYLOAD_SIZE;
             if (offset + chunk_len > total_bytes) {
                 chunk_len = total_bytes - offset;
             }
 
-            struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, sizeof(UdpHeader_t) + chunk_len, PBUF_RAM);
+            uint16_t packet_size = sizeof(VideoChunkHeader_t) + chunk_len;
+            struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, packet_size, PBUF_RAM);
             if (p != NULL) {
-                UdpHeader_t *hdr = (UdpHeader_t *)p->payload;
-                hdr->frame_id = frame_counter;
-                hdr->chunk_idx = next_chunk;
+                VideoChunkHeader_t *hdr = (VideoChunkHeader_t *)p->payload;
+                hdr->magic = STREAM_MAGIC;
+                hdr->pkt_type = PKT_TYPE_VIDEO_CHUNK;
+                hdr->reserved = 0;
+                hdr->chunk_idx = c;
                 hdr->total_chunks = total_chunks;
+                hdr->payload_len = chunk_len;
+                hdr->frame_id = frame_id;
 
-                memcpy((uint8_t *)p->payload + sizeof(UdpHeader_t), g_frame_buffer + offset, chunk_len);
+                memcpy((uint8_t *)p->payload + sizeof(VideoChunkHeader_t), frame_data + offset, chunk_len);
 
-                udp_sendto(udp_pcb, p, &target_ip, TARGET_PORT);
+                udp_sendto(stream_pcb, p, &target_ip, TARGET_PORT);
                 pbuf_free(p);
             }
-
-            next_chunk++;
-            if (next_chunk >= total_chunks) {
-                next_chunk = 0;
-                frame_counter++;
-                break; /* Frame complete, stop sending for this wake-up */
-            }
         }
+
+        s_stream_busy = false;
     }
 }
 
 void Ethernet_Streamer_Init(void) {
-    if (udp_pcb == NULL) {
-        udp_pcb = udp_new();
+    if (stream_pcb == NULL) {
+        memset(&s_meta_pkt, 0, sizeof(s_meta_pkt));
+        s_meta_pkt.magic = STREAM_MAGIC;
+        s_meta_pkt.pkt_type = PKT_TYPE_OD_METADATA;
+
+        stream_pcb = udp_new();
+        if (stream_pcb == NULL) {
+            PRINT("[ETH STREAM ERROR] udp_new() failed!\r\n");
+            return;
+        }
+
         IP4_ADDR(&target_ip, PC_IP_1, PC_IP_2, PC_IP_3, PC_IP_4);
-        udp_bind(udp_pcb, IP_ADDR_ANY, 0);
+        udp_bind(stream_pcb, IP_ADDR_ANY, 0);
 
         /* Create TRON Semaphore for Triggering */
         T_CSEM csem = {.exinf = NULL, .sematr = TA_TFIFO, .isemcnt = 0, .maxsem = 1};
-        sem_ethernet_ready = tk_cre_sem(&csem);
+        sem_stream_ready = tk_cre_sem(&csem);
 
-        /* Create and Start the Dedicated Ethernet Task */
+        /* Create Dedicated Background Task (Priority 11) */
         T_CTSK ctsk = {
             .exinf = NULL,
-            .tskatr = TA_HLNG | TA_RNG3,
-            .task = ethernet_task,
-            .itskpri = 10,  /* Normal Priority */
-            .stksz = 2048
+            .tskatr = TA_HLNG | TA_RNG0,
+            .task = ethernet_stream_task,
+            .itskpri = 11,
+            .stksz = 4096
         };
         ID eth_tsk = tk_cre_tsk(&ctsk);
-        tk_sta_tsk(eth_tsk, 0);
+        if (eth_tsk > 0) {
+            tk_sta_tsk(eth_tsk, 0);
+            PRINT("[ETH STREAM] Initialized UDP target: %d.%d.%d.%d:%d (Priority 11, Decoupled)\r\n",
+                  PC_IP_1, PC_IP_2, PC_IP_3, PC_IP_4, TARGET_PORT);
+        } else {
+            PRINT("[ETH STREAM ERROR] Failed to create streamer task: %d\r\n", eth_tsk);
+        }
     }
 }
 
-void Ethernet_Streamer_SendFrame(uint8_t *frame_buffer, uint32_t width, uint32_t height, uint8_t bytes_per_pixel) {
-    static uint32_t throttle = 0;
-    
-    /* Trigger Ethernet task EVERY frame (270 FPS triggers). 
-       Since we only send 3 chunks per trigger, this yields a solid 5.5 FPS video feed 
-       without EVER blocking the MAC descriptors! */
+/* Called directly from Camera Task on every frame (30 FPS) */
+void Ethernet_Streamer_SendVideoFrame(
+    const uint8_t *frame_buffer,
+    uint32_t width,
+    uint32_t height,
+    uint8_t bpp,
+    uint32_t frame_id
+) {
+    if (sem_stream_ready <= 0) return;
 
-    /* Update the pointers for the ethernet task */
-    g_frame_buffer = frame_buffer;
-    g_width = width;
-    g_height = height;
-    g_bpp = bytes_per_pixel;
-
-    /* Trigger the Ethernet Task instantly! */
-    if (sem_ethernet_ready > 0) {
-        tk_sig_sem(sem_ethernet_ready, 1);
+    /* If previous frame transmission is still in progress, drop this frame (zero lag) */
+    if (s_stream_busy) {
+        return;
     }
+
+    uint8_t write_idx = s_active_read_buf ^ 1;
+
+    if (bpp == 3) {
+        /* Ultra-fast RGB888 -> RGB565 conversion directly into internal cached SRAM */
+        convert_rgb888_to_rgb565(frame_buffer, s_rgb565_stream_buf[write_idx], width * height);
+        s_frame_bytes[write_idx] = width * height * 2;
+    } else {
+        memcpy(s_rgb565_stream_buf[write_idx], frame_buffer, width * height * bpp);
+        s_frame_bytes[write_idx] = width * height * bpp;
+    }
+
+    s_stream_frame_id[write_idx] = frame_id;
+    s_active_read_buf = write_idx;
+    s_stream_busy = true;
+
+    /* Wake up Ethernet Streamer Task */
+    tk_sig_sem(sem_stream_ready, 1);
+}
+
+/* Called from OD Task whenever an inference completes (~10-14 FPS) */
+void Ethernet_Streamer_UpdateDetections(
+    uint32_t frame_id,
+    uint32_t inference_ms,
+    uint8_t num_boxes,
+    const DetectionBox_t *boxes
+) {
+    s_meta_pkt.magic = STREAM_MAGIC;
+    s_meta_pkt.pkt_type = PKT_TYPE_OD_METADATA;
+    s_meta_pkt.num_boxes = (num_boxes > OD_MAX_STREAM_BOXES) ? OD_MAX_STREAM_BOXES : num_boxes;
+    s_meta_pkt.inference_ms = (uint16_t)inference_ms;
+    s_meta_pkt.frame_id = frame_id;
+    s_meta_pkt.img_width = 256;
+    s_meta_pkt.img_height = 256;
+
+    for (uint8_t i = 0; i < s_meta_pkt.num_boxes; i++) {
+        s_meta_pkt.boxes[i] = boxes[i];
+    }
+}
+
+/* Backward compatibility wrapper */
+void Ethernet_Streamer_SendFrameWithDetections(
+    const uint8_t *frame_buffer,
+    uint32_t width,
+    uint32_t height,
+    uint8_t bpp,
+    uint32_t frame_id,
+    uint32_t inference_ms,
+    uint8_t num_boxes,
+    const DetectionBox_t *boxes
+) {
+    Ethernet_Streamer_UpdateDetections(frame_id, inference_ms, num_boxes, boxes);
+    Ethernet_Streamer_SendVideoFrame(frame_buffer, width, height, bpp, frame_id);
 }
