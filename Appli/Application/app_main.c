@@ -30,7 +30,7 @@ LOCAL T_CTSK ctsk_net = {				     // Task creation information
 /* Camera Task Configuration */
 LOCAL ID	tskid_cam;
 LOCAL T_CTSK ctsk_cam = {
-	.itskpri	= 11,
+	.itskpri	= 9,
 	.stksz		= 4096,
 	.task		= camera_task,
 	.tskatr		= TA_HLNG | TA_RNG0,

@@ -16,7 +16,7 @@
 #define PC_IP_1 192
 #define PC_IP_2 168
 #define PC_IP_3 1
-#define PC_IP_4 100
+#define PC_IP_4 255  /* Subnet broadcast (192.168.1.255) - bypasses ARP resolution so UDP is sent immediately */
 
 #define TARGET_PORT 5000
 #define UDP_CHUNK_PAYLOAD_SIZE 1400
@@ -103,10 +103,16 @@ static void ethernet_stream_task(INT stacd, void *exinf) {
 
                 udp_sendto(stream_pcb, p, &target_ip, TARGET_PORT);
                 pbuf_free(p);
+
+                /* Cooperative yield every 16 chunks so OD task is never locked out */
+                if ((c & 15) == 0) {
+                    tk_rot_rdq(0);
+                }
             }
         }
 
         s_stream_busy = false;
+        tk_rot_rdq(0); /* Yield to other tasks */
     }
 }
 
@@ -129,7 +135,10 @@ void Ethernet_Streamer_Init(void) {
         T_CSEM csem = {.exinf = NULL, .sematr = TA_TFIFO, .isemcnt = 0, .maxsem = 1};
         sem_stream_ready = tk_cre_sem(&csem);
 
-        /* Create Dedicated Background Task (Priority 11) */
+/* Decimation factor: 2 = send 15 FPS (smooth display, balanced for NPU bus), 1 = 30 FPS */
+#define STREAM_DECIMATION 2
+
+        /* Create Dedicated Background Task (Priority 11 - co-operates with OD task) */
         T_CTSK ctsk = {
             .exinf = NULL,
             .tskatr = TA_HLNG | TA_RNG0,
@@ -140,7 +149,7 @@ void Ethernet_Streamer_Init(void) {
         ID eth_tsk = tk_cre_tsk(&ctsk);
         if (eth_tsk > 0) {
             tk_sta_tsk(eth_tsk, 0);
-            PRINT("[ETH STREAM] Initialized UDP target: %d.%d.%d.%d:%d (Priority 11, Decoupled)\r\n",
+            PRINT("[ETH STREAM] Initialized UDP target: %d.%d.%d.%d:%d (Priority 11, Balanced)\r\n",
                   PC_IP_1, PC_IP_2, PC_IP_3, PC_IP_4, TARGET_PORT);
         } else {
             PRINT("[ETH STREAM ERROR] Failed to create streamer task: %d\r\n", eth_tsk);
@@ -157,6 +166,12 @@ void Ethernet_Streamer_SendVideoFrame(
     uint32_t frame_id
 ) {
     if (sem_stream_ready <= 0) return;
+
+    /* Rate decimation: Send at 15 FPS to leave bus bandwidth for NPU */
+    static uint32_t s_stream_div = 0;
+    if (++s_stream_div % STREAM_DECIMATION != 0) {
+        return;
+    }
 
     /* If previous frame transmission is still in progress, drop this frame (zero lag) */
     if (s_stream_busy) {

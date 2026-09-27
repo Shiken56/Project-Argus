@@ -94,7 +94,7 @@ LOCAL void npu_watchdog_task(INT stacd, void *exinf) {
 
 LOCAL ID tskid_npu_wdg;
 LOCAL T_CTSK ctsk_npu_wdg = {
-    .itskpri = 11,
+    .itskpri = 9,
     .stksz = 4096,
     .task = npu_watchdog_task,
     .tskatr = TA_HLNG | TA_RNG0,
@@ -245,13 +245,16 @@ LOCAL void od_task(INT stacd, void *exinf) {
         Ethernet_Streamer_UpdateDetections(
             inf_count, inf_ms, num_detected, detected_boxes
         );
+
+        /* Yield CPU to allow same-priority Ethernet streamer task to transmit */
+        tk_rot_rdq(0);
     }
   }
 }
 
 LOCAL ID tskid_od;
 LOCAL T_CTSK ctsk_od = {
-    .itskpri = 12,
+    .itskpri = 11,
     .stksz = 8192,
     .task = od_task,
     .tskatr = TA_HLNG | TA_RNG0,
