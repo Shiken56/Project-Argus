@@ -8,14 +8,6 @@
 #define PRINT(fmt, ...) tm_printf((const UB *)(fmt), ##__VA_ARGS__)
 
 static void NNLIB_Hardware_Init(void) {
-  /* 0. RIF (Resource Isolation Framework) Configuration for NPU Master & Slaves */
-  __HAL_RCC_RIFSC_CLK_ENABLE();
-  RIMC_MasterConfig_t RIMC_master = {0};
-  RIMC_master.MasterCID = RIF_CID_1;
-  RIMC_master.SecPriv = RIF_ATTRIBUTE_SEC | RIF_ATTRIBUTE_PRIV;
-  HAL_RIF_RIMC_ConfigMasterAttributes(RIF_MASTER_INDEX_NPU, &RIMC_master);
-  HAL_RIF_RISC_SetSlaveSecureAttributes(RIF_RISC_PERIPH_INDEX_NPU, RIF_ATTRIBUTE_SEC | RIF_ATTRIBUTE_PRIV);
-
   /* 1. NPU Reset and Clock Enable */
   __HAL_RCC_CACHEAXI_CLK_ENABLE();
   __HAL_RCC_NPU_CLK_ENABLE();
