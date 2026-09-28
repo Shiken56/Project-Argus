@@ -35,6 +35,10 @@ static uint32_t s_stream_frame_id[2] = {0, 0};
 /* Shared detection metadata (updated by OD task, transmitted by Streamer task) */
 static OdMetadataPacket_t s_meta_pkt;
 
+/* Shared ReID metadata (updated by FX task, transmitted by Streamer task) */
+static ReidMetadataPacket_t s_reid_pkt;
+static volatile bool s_reid_pending = false;
+
 static inline void convert_rgb888_to_rgb565(const uint8_t *src, uint16_t *dst, uint32_t num_pixels) {
     for (uint32_t i = 0; i < num_pixels; i++) {
         uint8_t r = src[i * 3 + 0];
@@ -75,6 +79,22 @@ static void ethernet_stream_task(INT stacd, void *exinf) {
             memcpy(p_meta->payload, &meta_copy, sizeof(OdMetadataPacket_t));
             udp_sendto(stream_pcb, p_meta, &target_ip, TARGET_PORT);
             pbuf_free(p_meta);
+        }
+
+        /* 1b. Transmit ReID Packet if ready (Thread-safe: only streamer task calls LwIP) */
+        if (s_reid_pending) {
+            uint16_t reid_len = s_reid_pkt.embedding_len;
+            if (reid_len > 128) reid_len = 128;
+            uint16_t pkt_size = (uint16_t)(sizeof(uint32_t) + sizeof(uint8_t) + sizeof(uint8_t)
+                                 + sizeof(uint16_t) + sizeof(uint32_t) + reid_len);
+
+            struct pbuf *p_reid = pbuf_alloc(PBUF_TRANSPORT, pkt_size, PBUF_RAM);
+            if (p_reid != NULL) {
+                memcpy(p_reid->payload, &s_reid_pkt, pkt_size);
+                udp_sendto(stream_pcb, p_reid, &target_ip, TARGET_PORT);
+                pbuf_free(p_reid);
+            }
+            s_reid_pending = false;
         }
 
         /* 2. Transmit Video Chunks */
@@ -121,6 +141,11 @@ void Ethernet_Streamer_Init(void) {
         memset(&s_meta_pkt, 0, sizeof(s_meta_pkt));
         s_meta_pkt.magic = STREAM_MAGIC;
         s_meta_pkt.pkt_type = PKT_TYPE_OD_METADATA;
+
+        memset(&s_reid_pkt, 0, sizeof(s_reid_pkt));
+        s_reid_pkt.magic = STREAM_MAGIC;
+        s_reid_pkt.pkt_type = PKT_TYPE_REID_METADATA;
+        s_reid_pending = false;
 
         stream_pcb = udp_new();
         if (stream_pcb == NULL) {
@@ -223,27 +248,18 @@ void Ethernet_Streamer_UpdateReID(
     const int8_t *embedding,
     uint16_t embedding_len)
 {
-    if (stream_pcb == NULL || embedding == NULL || embedding_len == 0) return;
+    if (embedding == NULL || embedding_len == 0) return;
 
     /* Cap embedding length to fit in our packet struct */
     if (embedding_len > 128) embedding_len = 128;
 
-    uint16_t pkt_size = (uint16_t)(sizeof(uint32_t) + sizeof(uint8_t) + sizeof(uint8_t)
-                         + sizeof(uint16_t) + sizeof(uint32_t) + embedding_len);
-
-    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, pkt_size, PBUF_RAM);
-    if (p != NULL) {
-        ReidMetadataPacket_t *pkt = (ReidMetadataPacket_t *)p->payload;
-        pkt->magic         = STREAM_MAGIC;
-        pkt->pkt_type      = PKT_TYPE_REID_METADATA;
-        pkt->box_index     = 0;   /* Always top-1 detection for now */
-        pkt->embedding_len = embedding_len;
-        pkt->frame_id      = frame_id;
-        memcpy(pkt->embedding, embedding, embedding_len);
-
-        udp_sendto(stream_pcb, p, &target_ip, TARGET_PORT);
-        pbuf_free(p);
-    }
+    s_reid_pkt.magic         = STREAM_MAGIC;
+    s_reid_pkt.pkt_type      = PKT_TYPE_REID_METADATA;
+    s_reid_pkt.box_index     = 0;   /* Always top-1 detection for now */
+    s_reid_pkt.embedding_len = embedding_len;
+    s_reid_pkt.frame_id      = frame_id;
+    memcpy(s_reid_pkt.embedding, embedding, embedding_len);
+    s_reid_pending = true;
 }
 
 /* Backward compatibility wrapper */
