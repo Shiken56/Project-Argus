@@ -88,6 +88,11 @@ void camera_task(INT stacd, void *exinf) {
   CameraPipeline_DisplayPipe_Start(display_buffer, CMW_MODE_CONTINUOUS);
   CameraPipeline_NNPipe_Start(ml_buffer, CMW_MODE_CONTINUOUS);
 
+  /* Set nominal indoor exposure (25 ms) and sensor gain (18 dB) */
+  CMW_CAMERA_SetExposure(25000);
+  CMW_CAMERA_SetGain(18000);
+  PRINT("[CAMERA] Set nominal exposure: 25000 us (25 ms), gain: 18000 mdB (18 dB)\r\n");
+
   PRINT("[CAMERA] Streaming started on Pipe 1 & 2! Waiting for frames...\r\n\r\n");
 
   uint32_t frame_count = 0;
@@ -139,8 +144,8 @@ void camera_task(INT stacd, void *exinf) {
       tk_sig_sem(sem_od_frame_ready, 1);
     }
 
-    /* Background process for Auto-Exposure & ISP stats update */
-    CMW_CAMERA_Run();
+    /* Background process for Auto-Exposure commented out to prevent 0-exposure collapse on Pipe 2 */
+    // CMW_CAMERA_Run();
 
     frame_count++;
 

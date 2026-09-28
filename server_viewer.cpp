@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <string>
+#include <cmath>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -20,8 +21,12 @@
 #define STREAM_MAGIC 0x54524F4EU
 #define PKT_TYPE_VIDEO_CHUNK 0x01
 #define PKT_TYPE_OD_METADATA 0x02
+#define PKT_TYPE_REID_METADATA 0x03
+
 #define LISTEN_PORT 5000
 #define OD_MAX_BOXES 10
+#define REID_EMBEDDING_DIM 128
+#define REID_SIMILARITY_THRESHOLD 0.58f
 
 #pragma pack(push, 1)
 struct DetectionBox_t {
@@ -54,24 +59,103 @@ struct VideoChunkHeader_t {
     uint16_t payload_len;
     uint32_t frame_id;
 };
+
+struct ReidMetadataPacket_t {
+    uint32_t magic;          // STREAM_MAGIC (0x54524F4E)
+    uint8_t  pkt_type;       // PKT_TYPE_REID_METADATA (3)
+    uint8_t  box_index;      // 0 = top-1 detection
+    uint16_t embedding_len;  // 128
+    uint32_t frame_id;       // Synchronized with video frame_id
+    int8_t   embedding[REID_EMBEDDING_DIM]; // Signed INT8 OSNet embedding vector
+};
 #pragma pack(pop)
 
-// Shared state between receiver thread and GUI
+// UI Dimensions
 static const int FRAME_W = 256;
 static const int FRAME_H = 256;
 static const int DISP_W = 512;
 static const int DISP_H = 512;
+static const int HEADER_H = 36;
+static const int SIDEBAR_W = 280;
+static const int TOTAL_W = DISP_W + SIDEBAR_W;
+static const int TOTAL_H = DISP_H + HEADER_H;
 
+// Distinct Neon/Vivid colors for tracked individuals
+static const COLORREF ID_COLORS[] = {
+    RGB(0, 255, 255),    // Cyan
+    RGB(255, 140, 0),    // Vivid Orange
+    RGB(50, 255, 120),   // Neon Green
+    RGB(255, 60, 200),   // Vibrant Magenta
+    RGB(255, 230, 20),   // Yellow
+    RGB(130, 110, 255),  // Purple
+    RGB(0, 190, 255),    // Sky Blue
+    RGB(255, 80, 80)     // Coral Red
+};
+static const int NUM_ID_COLORS = sizeof(ID_COLORS) / sizeof(ID_COLORS[0]);
+
+// ReID Profile Structure
+struct PersonProfile {
+    int id;
+    std::vector<float> feature; // L2 normalized feature vector
+    COLORREF color;
+    uint32_t last_seen_frame;
+    int match_count;
+    float last_similarity;
+    std::chrono::steady_clock::time_point last_seen_time;
+};
+
+// Thread Synchronization & Shared Data
 static CRITICAL_SECTION g_cs;
-static std::vector<uint32_t> g_rgb32_buffer(FRAME_W * FRAME_H, 0); // 32-bit XRGB for GDI
+static std::vector<uint32_t> g_rgb32_buffer(FRAME_W * FRAME_H, 0); // 32-bit XRGB
 static OdMetadataPacket_t g_latest_meta = {};
 static uint32_t g_current_frame_id = 0;
 static double g_stream_fps = 0.0;
 static bool g_has_frame = false;
 static bool g_running = true;
 
+// Visual Adjustments
+static bool g_swap_rb = false;
+static float g_brightness_gain = 1.0f;
+
+// ReID State
+static std::vector<PersonProfile> g_gallery;
+static int g_latest_reid_id = 0;
+static float g_latest_reid_sim = 0.0f;
+static COLORREF g_latest_reid_color = RGB(0, 255, 0);
+static uint32_t g_latest_reid_frame = 0;
+static std::chrono::steady_clock::time_point g_latest_reid_time;
+static std::vector<int8_t> g_raw_latest_embedding(REID_EMBEDDING_DIM, 0);
+static uint32_t g_reid_total_count = 0;
+
 // Window Handle
 static HWND g_hwnd = NULL;
+
+// Helper: Normalize INT8 vector to L2 unit float vector
+static std::vector<float> normalize_int8_embedding(const int8_t* raw, size_t len) {
+    std::vector<float> vec(len);
+    float sum_sq = 0.0f;
+    for (size_t i = 0; i < len; i++) {
+        vec[i] = static_cast<float>(raw[i]);
+        sum_sq += vec[i] * vec[i];
+    }
+    float norm = std::sqrt(sum_sq);
+    if (norm > 1e-6f) {
+        for (size_t i = 0; i < len; i++) {
+            vec[i] /= norm;
+        }
+    }
+    return vec;
+}
+
+// Helper: Compute Cosine Similarity between two L2-normalized float vectors
+static float compute_cosine_similarity(const std::vector<float>& a, const std::vector<float>& b) {
+    if (a.size() != b.size() || a.empty()) return 0.0f;
+    float dot = 0.0f;
+    for (size_t i = 0; i < a.size(); i++) {
+        dot += a[i] * b[i];
+    }
+    return dot;
+}
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -84,14 +168,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             OdMetadataPacket_t meta = g_latest_meta;
             uint32_t frame_id = g_current_frame_id;
             double fps = g_stream_fps;
+
+            int reid_id = g_latest_reid_id;
+            float reid_sim = g_latest_reid_sim;
+            COLORREF reid_col = g_latest_reid_color;
+            auto reid_time = g_latest_reid_time;
+            std::vector<PersonProfile> gallery_copy = g_gallery;
+            std::vector<int8_t> spark_emb = g_raw_latest_embedding;
+            uint32_t total_reid = g_reid_total_count;
             LeaveCriticalSection(&g_cs);
 
             // Double buffering memory DC
             HDC memDC = CreateCompatibleDC(hdc);
-            HBITMAP memBmp = CreateCompatibleBitmap(hdc, DISP_W, DISP_H + 32);
+            HBITMAP memBmp = CreateCompatibleBitmap(hdc, TOTAL_W, TOTAL_H);
             HBITMAP oldBmp = (HBITMAP)SelectObject(memDC, memBmp);
 
-            // Create DIB section to blit our 256x256 image
+            // Clear full canvas background
+            RECT fullRect = {0, 0, TOTAL_W, TOTAL_H};
+            HBRUSH bgBrush = CreateSolidBrush(RGB(15, 17, 23));
+            FillRect(memDC, &fullRect, bgBrush);
+            DeleteObject(bgBrush);
+
+            // DIB section header to blit 256x256 image
             BITMAPINFO bmi = {};
             bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
             bmi.bmiHeader.biWidth = FRAME_W;
@@ -100,69 +198,194 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             bmi.bmiHeader.biBitCount = 32;
             bmi.bmiHeader.biCompression = BI_RGB;
 
-            // Header status bar
-            RECT bannerRect = {0, 0, DISP_W, 32};
-            HBRUSH bannerBrush = CreateSolidBrush(RGB(20, 20, 25));
+            // 1. Top Header Banner
+            RECT bannerRect = {0, 0, TOTAL_W, HEADER_H};
+            HBRUSH bannerBrush = CreateSolidBrush(RGB(22, 27, 34));
             FillRect(memDC, &bannerRect, bannerBrush);
             DeleteObject(bannerBrush);
 
-            char bannerText[128];
-            snprintf(bannerText, sizeof(bannerText),
-                     " Frame #%u | NPU: %u ms | Stream: %.1f FPS | Detections: %u",
-                     frame_id, (unsigned int)meta.inference_ms, fps, (unsigned int)meta.num_boxes);
+            HPEN divPen = CreatePen(PS_SOLID, 1, RGB(48, 54, 61));
+            HPEN oldPen = (HPEN)SelectObject(memDC, divPen);
+            MoveToEx(memDC, 0, HEADER_H - 1, NULL);
+            LineTo(memDC, TOTAL_W, HEADER_H - 1);
 
-            SetTextColor(memDC, RGB(0, 255, 255));
+            char bannerText[256];
+            snprintf(bannerText, sizeof(bannerText),
+                     "  STM32N6 EDGE-AI STREAM | Frame #%u | Video: %.1f FPS | YOLO: %u ms | ReID: ~22 ms | ReID Embs: %u",
+                     frame_id, fps, (unsigned int)meta.inference_ms, total_reid);
+
+            SetTextColor(memDC, RGB(0, 240, 255));
             SetBkMode(memDC, TRANSPARENT);
             DrawTextA(memDC, bannerText, -1, &bannerRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
 
-            // StretchBlt from 256x256 to 512x512
+            // 2. Video Frame Blit (512x512)
             SetStretchBltMode(memDC, COLORONCOLOR);
             StretchDIBits(memDC,
-                          0, 32, DISP_W, DISP_H,
+                          0, HEADER_H, DISP_W, DISP_H,
                           0, 0, FRAME_W, FRAME_H,
                           local_pixels.data(),
                           &bmi,
                           DIB_RGB_COLORS,
                           SRCCOPY);
 
-            // Draw bounding boxes on top
-            HPEN boxPen = CreatePen(PS_SOLID, 3, RGB(0, 255, 0));
-            HPEN oldPen = (HPEN)SelectObject(memDC, boxPen);
-            HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, GetStockObject(HOLLOW_BRUSH));
+            // 3. Draw Bounding Boxes + ReID Identity Overlay
+            auto now = std::chrono::steady_clock::now();
+            double reid_age_sec = std::chrono::duration<double>(now - reid_time).count();
+            bool reid_active = (reid_id > 0 && reid_age_sec < 2.0);
 
             for (uint8_t i = 0; i < meta.num_boxes; i++) {
                 int cx = (int)(meta.boxes[i].cx * DISP_W);
-                int cy = (int)(meta.boxes[i].cy * DISP_H) + 32;
+                int cy = (int)(meta.boxes[i].cy * DISP_H) + HEADER_H;
                 int bw = (int)(meta.boxes[i].w * DISP_W);
                 int bh = (int)(meta.boxes[i].h * DISP_H);
 
                 int x1 = std::max(0, cx - bw / 2);
-                int y1 = std::max(32, cy - bh / 2);
+                int y1 = std::max(HEADER_H, cy - bh / 2);
                 int x2 = std::min(DISP_W - 1, cx + bw / 2);
-                int y2 = std::min(DISP_H + 32 - 1, cy + bh / 2);
+                int y2 = std::min(HEADER_H + DISP_H - 1, cy + bh / 2);
+
+                COLORREF boxColor = (i == 0 && reid_active) ? reid_col : RGB(0, 255, 120);
+                HPEN boxPen = CreatePen(PS_SOLID, 3, boxColor);
+                SelectObject(memDC, boxPen);
+                HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, GetStockObject(HOLLOW_BRUSH));
 
                 Rectangle(memDC, x1, y1, x2, y2);
 
-                char label[32];
+                // Label Banner above bounding box
+                char label[64];
                 int conf_pct = (int)(meta.boxes[i].conf * 100.0f);
-                snprintf(label, sizeof(label), " Obj: %d%% ", conf_pct);
+                if (i == 0 && reid_active) {
+                    snprintf(label, sizeof(label), " ID: #%d (%d%%) | Conf: %d%% ",
+                             reid_id, (int)(reid_sim * 100.0f), conf_pct);
+                } else {
+                    snprintf(label, sizeof(label), " Person: %d%% ", conf_pct);
+                }
 
-                RECT labelRect = {x1, std::max(32, y1 - 20), x1 + 80, y1};
-                HBRUSH labelBg = CreateSolidBrush(RGB(0, 255, 0));
+                RECT labelRect = {x1, std::max(HEADER_H, y1 - 22), x1 + 175, y1};
+                HBRUSH labelBg = CreateSolidBrush(boxColor);
                 FillRect(memDC, &labelRect, labelBg);
                 DeleteObject(labelBg);
 
                 SetTextColor(memDC, RGB(0, 0, 0));
                 DrawTextA(memDC, label, -1, &labelRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+
+                SelectObject(memDC, oldBrush);
+                SelectObject(memDC, oldPen);
+                DeleteObject(boxPen);
             }
 
+            // 4. Right Sidebar: ReID Gallery & Telemetry
+            RECT sidebarRect = {DISP_W, HEADER_H, TOTAL_W, TOTAL_H};
+            HBRUSH sideBrush = CreateSolidBrush(RGB(18, 22, 30));
+            FillRect(memDC, &sidebarRect, sideBrush);
+            DeleteObject(sideBrush);
+
+            // Vertical divider line between Video and Sidebar
+            MoveToEx(memDC, DISP_W, HEADER_H, NULL);
+            LineTo(memDC, DISP_W, TOTAL_H);
+
+            // Sidebar Title
+            RECT titleRect = {DISP_W + 12, HEADER_H + 10, TOTAL_W - 12, HEADER_H + 32};
+            SetTextColor(memDC, RGB(255, 255, 255));
+            DrawTextA(memDC, "TARGET RE-IDENTIFICATION", -1, &titleRect, DT_SINGLELINE | DT_LEFT);
+
+            // Subtitle
+            RECT subRect = {DISP_W + 12, HEADER_H + 30, TOTAL_W - 12, HEADER_H + 50};
+            SetTextColor(memDC, RGB(110, 118, 129));
+            DrawTextA(memDC, "Gallery Identities (OSNet INT8)", -1, &subRect, DT_SINGLELINE | DT_LEFT);
+
+            // Divider in sidebar
+            MoveToEx(memDC, DISP_W + 10, HEADER_H + 52, NULL);
+            LineTo(memDC, TOTAL_W - 10, HEADER_H + 52);
+
+            // Render Gallery List
+            int cardY = HEADER_H + 60;
+            if (gallery_copy.empty()) {
+                RECT emptyRect = {DISP_W + 12, cardY, TOTAL_W - 12, cardY + 30};
+                SetTextColor(memDC, RGB(139, 148, 158));
+                DrawTextA(memDC, "No targets tracked yet...", -1, &emptyRect, DT_SINGLELINE | DT_LEFT);
+            } else {
+                for (size_t i = 0; i < gallery_copy.size() && i < 6; i++) {
+                    const auto& prof = gallery_copy[i];
+                    double age = std::chrono::duration<double>(now - prof.last_seen_time).count();
+                    bool active = (age < 2.5);
+
+                    RECT cardRect = {DISP_W + 10, cardY, TOTAL_W - 10, cardY + 44};
+                    HBRUSH cardBg = CreateSolidBrush(active ? RGB(26, 35, 48) : RGB(20, 24, 32));
+                    FillRect(memDC, &cardRect, cardBg);
+                    DeleteObject(cardBg);
+
+                    // Identity Color Badge
+                    RECT badgeRect = {DISP_W + 14, cardY + 8, DISP_W + 28, cardY + 36};
+                    HBRUSH badgeBrush = CreateSolidBrush(prof.color);
+                    FillRect(memDC, &badgeRect, badgeBrush);
+                    DeleteObject(badgeBrush);
+
+                    // Text Info
+                    char idStr[64];
+                    snprintf(idStr, sizeof(idStr), "Person #%d  %s", prof.id, active ? "[LIVE]" : "[LOST]");
+                    RECT idRect = {DISP_W + 36, cardY + 4, TOTAL_W - 14, cardY + 22};
+                    SetTextColor(memDC, active ? prof.color : RGB(139, 148, 158));
+                    DrawTextA(memDC, idStr, -1, &idRect, DT_SINGLELINE | DT_LEFT);
+
+                    char statStr[64];
+                    snprintf(statStr, sizeof(statStr), "Matches: %d | Sim: %d%%",
+                             prof.match_count, (int)(prof.last_similarity * 100.0f));
+                    RECT statRect = {DISP_W + 36, cardY + 22, TOTAL_W - 14, cardY + 40};
+                    SetTextColor(memDC, RGB(180, 190, 205));
+                    DrawTextA(memDC, statStr, -1, &statRect, DT_SINGLELINE | DT_LEFT);
+
+                    cardY += 50;
+                }
+            }
+
+            // 5. Live INT8 Embedding Signature (128 Dimensions)
+            int sparkY = TOTAL_H - 105;
+            RECT sparkTitleRect = {DISP_W + 12, sparkY, TOTAL_W - 12, sparkY + 18};
+            SetTextColor(memDC, RGB(0, 240, 255));
+            DrawTextA(memDC, "LIVE INT8 EMBEDDING (128-D)", -1, &sparkTitleRect, DT_SINGLELINE | DT_LEFT);
+
+            // Frame box for sparkline
+            RECT sparkBox = {DISP_W + 10, sparkY + 20, TOTAL_W - 10, sparkY + 80};
+            HBRUSH sparkBg = CreateSolidBrush(RGB(10, 13, 18));
+            FillRect(memDC, &sparkBox, sparkBg);
+            DeleteObject(sparkBg);
+
+            // Draw center zero line
+            int zeroY = sparkY + 50;
+            HPEN zeroPen = CreatePen(PS_DOT, 1, RGB(45, 55, 72));
+            SelectObject(memDC, zeroPen);
+            MoveToEx(memDC, sparkBox.left, zeroY, NULL);
+            LineTo(memDC, sparkBox.right, zeroY);
             SelectObject(memDC, oldPen);
-            SelectObject(memDC, oldBrush);
-            DeleteObject(boxPen);
+            DeleteObject(zeroPen);
 
-            // Blit composite buffer to screen
-            BitBlt(hdc, 0, 0, DISP_W, DISP_H + 32, memDC, 0, 0, SRCCOPY);
+            // Draw 128 vertical bars for the embedding
+            float barW = (float)(sparkBox.right - sparkBox.left) / 128.0f;
+            for (int i = 0; i < REID_EMBEDDING_DIM; i++) {
+                int val = spark_emb[i]; // -128 to 127
+                int barH = (int)((val / 128.0f) * 26.0f);
+                int bx = sparkBox.left + (int)(i * barW);
 
+                COLORREF barColor = (val >= 0) ? RGB(0, 255, 180) : RGB(255, 80, 100);
+                HPEN barPen = CreatePen(PS_SOLID, 1, barColor);
+                SelectObject(memDC, barPen);
+                MoveToEx(memDC, bx, zeroY, NULL);
+                LineTo(memDC, bx, zeroY - barH);
+                SelectObject(memDC, oldPen);
+                DeleteObject(barPen);
+            }
+
+            // Bottom controls hint
+            RECT hintRect = {DISP_W + 12, TOTAL_H - 20, TOTAL_W - 12, TOTAL_H - 4};
+            SetTextColor(memDC, RGB(80, 90, 105));
+            DrawTextA(memDC, "[R] Reset | [C] RGB/BGR | [+/-] Gain | [Q] Quit", -1, &hintRect, DT_SINGLELINE | DT_LEFT);
+
+            // Composite blit to screen
+            BitBlt(hdc, 0, 0, TOTAL_W, TOTAL_H, memDC, 0, 0, SRCCOPY);
+
+            SelectObject(memDC, oldPen);
+            DeleteObject(divPen);
             SelectObject(memDC, oldBmp);
             DeleteObject(memBmp);
             DeleteDC(memDC);
@@ -178,6 +401,26 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_KEYDOWN: {
             if (wParam == VK_ESCAPE || wParam == 'Q') {
                 DestroyWindow(hwnd);
+            } else if (wParam == 'R') {
+                // Reset ReID Gallery
+                EnterCriticalSection(&g_cs);
+                g_gallery.clear();
+                g_latest_reid_id = 0;
+                g_latest_reid_sim = 0.0f;
+                LeaveCriticalSection(&g_cs);
+                std::cout << "[*] ReID Identity Gallery Reset.\n";
+            } else if (wParam == 'C') {
+                g_swap_rb = !g_swap_rb;
+                std::cout << "[*] Color Mode: " << (g_swap_rb ? "BGR" : "RGB") << "\n";
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (wParam == VK_ADD || wParam == VK_OEM_PLUS) {
+                g_brightness_gain = std::min(10.0f, g_brightness_gain + 0.5f);
+                std::cout << "[*] Brightness Gain: " << g_brightness_gain << "x\n";
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (wParam == VK_SUBTRACT || wParam == VK_OEM_MINUS) {
+                g_brightness_gain = std::max(0.5f, g_brightness_gain - 0.5f);
+                std::cout << "[*] Brightness Gain: " << g_brightness_gain << "x\n";
+                InvalidateRect(hwnd, NULL, FALSE);
             }
             return 0;
         }
@@ -240,18 +483,89 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
 
         uint8_t pkt_type = recv_buf[4];
 
-        // Metadata packet
-        if (pkt_type == PKT_TYPE_OD_METADATA && bytes >= (int)sizeof(OdMetadataPacket_t)) {
+        // 1. ReID Metadata Packet
+        if (pkt_type == PKT_TYPE_REID_METADATA && bytes >= (int)sizeof(ReidMetadataPacket_t)) {
+            ReidMetadataPacket_t reid_pkt;
+            memcpy(&reid_pkt, recv_buf.data(), sizeof(ReidMetadataPacket_t));
+
+            std::vector<float> norm_emb = normalize_int8_embedding(reid_pkt.embedding, REID_EMBEDDING_DIM);
+
+            EnterCriticalSection(&g_cs);
+            int best_id = -1;
+            float best_sim = -1.0f;
+            int best_idx = -1;
+
+            for (size_t i = 0; i < g_gallery.size(); i++) {
+                float sim = compute_cosine_similarity(g_gallery[i].feature, norm_emb);
+                if (sim > best_sim) {
+                    best_sim = sim;
+                    best_id = g_gallery[i].id;
+                    best_idx = (int)i;
+                }
+            }
+
+            if (best_sim >= REID_SIMILARITY_THRESHOLD && best_idx >= 0) {
+                // Update existing person profile with EMA
+                for (size_t i = 0; i < REID_EMBEDDING_DIM; i++) {
+                    g_gallery[best_idx].feature[i] = 0.80f * g_gallery[best_idx].feature[i] + 0.20f * norm_emb[i];
+                }
+                // Re-normalize
+                float s_sq = 0.0f;
+                for (float v : g_gallery[best_idx].feature) s_sq += v * v;
+                float n_val = std::sqrt(s_sq);
+                if (n_val > 1e-6f) {
+                    for (float &v : g_gallery[best_idx].feature) v /= n_val;
+                }
+                g_gallery[best_idx].match_count++;
+                g_gallery[best_idx].last_seen_frame = reid_pkt.frame_id;
+                g_gallery[best_idx].last_similarity = best_sim;
+                g_gallery[best_idx].last_seen_time = std::chrono::steady_clock::now();
+
+                g_latest_reid_id = best_id;
+                g_latest_reid_sim = best_sim;
+                g_latest_reid_color = g_gallery[best_idx].color;
+            } else {
+                // Register new unique identity
+                int new_id = (int)g_gallery.size() + 1;
+                COLORREF color = ID_COLORS[(new_id - 1) % NUM_ID_COLORS];
+                PersonProfile p;
+                p.id = new_id;
+                p.feature = norm_emb;
+                p.color = color;
+                p.last_seen_frame = reid_pkt.frame_id;
+                p.match_count = 1;
+                p.last_similarity = 1.0f;
+                p.last_seen_time = std::chrono::steady_clock::now();
+                g_gallery.push_back(p);
+
+                g_latest_reid_id = new_id;
+                g_latest_reid_sim = 1.0f;
+                g_latest_reid_color = color;
+
+                std::cout << "[+] Registered New Identity: Person #" << new_id << "\n";
+            }
+
+            g_latest_reid_frame = reid_pkt.frame_id;
+            g_latest_reid_time = std::chrono::steady_clock::now();
+            g_raw_latest_embedding.assign(reid_pkt.embedding, reid_pkt.embedding + REID_EMBEDDING_DIM);
+            g_reid_total_count++;
+            LeaveCriticalSection(&g_cs);
+
+            if (g_hwnd) {
+                InvalidateRect(g_hwnd, NULL, FALSE);
+            }
+        }
+        // 2. OD Metadata Packet
+        else if (pkt_type == PKT_TYPE_OD_METADATA && bytes >= (int)sizeof(OdMetadataPacket_t)) {
             memcpy(&current_meta, recv_buf.data(), sizeof(OdMetadataPacket_t));
         }
-        // Video chunk packet
+        // 3. Video Chunk Packet
         else if (pkt_type == PKT_TYPE_VIDEO_CHUNK && bytes >= (int)sizeof(VideoChunkHeader_t)) {
             VideoChunkHeader_t hdr;
             memcpy(&hdr, recv_buf.data(), sizeof(VideoChunkHeader_t));
 
             int payload_len = hdr.payload_len;
             if (sizeof(VideoChunkHeader_t) + payload_len <= (size_t)bytes) {
-                // Auto stride: 1400 bytes for RGB565 (<= 100 chunks), 1024 for RGB888
                 int stride = (hdr.total_chunks <= 100) ? 1400 : 1024;
                 int offset = hdr.chunk_idx * stride;
 
@@ -267,20 +581,32 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
                 }
                 chunks_received++;
 
-                // Frame complete or last chunk
+                // Frame complete or last chunk received
                 if (chunks_received >= hdr.total_chunks || hdr.chunk_idx == hdr.total_chunks - 1) {
-                    // Fast convert RGB565 to 32-bit XRGB for high-speed Direct GDI blitting
                     EnterCriticalSection(&g_cs);
                     const uint16_t* p565 = (const uint16_t*)raw_frame_565.data();
+                    bool swap = g_swap_rb;
+                    float gain = g_brightness_gain;
                     for (int i = 0; i < FRAME_W * FRAME_H; i++) {
                         uint16_t c = p565[i];
-                        uint8_t r = (c >> 11) & 0x1F;
-                        uint8_t g = (c >> 5) & 0x3F;
-                        uint8_t b = c & 0x1F;
-                        // Scale 5/6 bits to 8 bits
-                        r = (r * 527 + 23) >> 6;
-                        g = (g * 259 + 33) >> 6;
-                        b = (b * 527 + 23) >> 6;
+                        uint8_t cr = (c >> 11) & 0x1F;
+                        uint8_t cg = (c >> 5) & 0x3F;
+                        uint8_t cb = c & 0x1F;
+                        uint8_t r = (cr * 527 + 23) >> 6;
+                        uint8_t g = (cg * 259 + 33) >> 6;
+                        uint8_t b = (cb * 527 + 23) >> 6;
+
+                        if (swap) {
+                            std::swap(r, b);
+                        }
+                        if (gain != 1.0f) {
+                            int ir = (int)(r * gain);
+                            int ig = (int)(g * gain);
+                            int ib = (int)(b * gain);
+                            r = (uint8_t)std::min(255, ir);
+                            g = (uint8_t)std::min(255, ig);
+                            b = (uint8_t)std::min(255, ib);
+                        }
                         g_rgb32_buffer[i] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
                     }
                     g_latest_meta = current_meta;
@@ -300,7 +626,7 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
                         fps_start = now;
                     }
 
-                    // Trigger Window Repaint
+                    // Trigger Repaint
                     if (g_hwnd) {
                         InvalidateRect(g_hwnd, NULL, FALSE);
                     }
@@ -318,7 +644,7 @@ int main() {
     InitializeCriticalSection(&g_cs);
 
     std::cout << "=========================================================\n";
-    std::cout << "  STM32N6 Native High-Speed C++ Video Stream Viewer      \n";
+    std::cout << "  STM32N6 Object Re-Identification (ReID) Viewer Server  \n";
     std::cout << "=========================================================\n";
     std::cout << "[*] Starting background multi-threaded UDP receiver...\n";
 
@@ -334,7 +660,7 @@ int main() {
     wc.cbSize = sizeof(WNDCLASSEXA);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
-    wc.lpszClassName = "STM32N6_Viewer_Class";
+    wc.lpszClassName = "STM32N6_ReID_Viewer_Class";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
 
@@ -343,14 +669,14 @@ int main() {
         return 1;
     }
 
-    // Window size: 512x544 (512x512 video + 32px top status banner)
-    RECT wr = {0, 0, DISP_W, DISP_H + 32};
+    // Window size: 792x548 (512x512 Video + 280px Gallery Sidebar + 36px Top Banner)
+    RECT wr = {0, 0, TOTAL_W, TOTAL_H};
     AdjustWindowRect(&wr, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
 
     g_hwnd = CreateWindowExA(
         0,
-        "STM32N6_Viewer_Class",
-        "STM32N6 Object Detection Live Stream (C++ Native)",
+        "STM32N6_ReID_Viewer_Class",
+        "STM32N6 Object Detection & Re-Identification HUD",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT,
         wr.right - wr.left, wr.bottom - wr.top,
@@ -365,7 +691,9 @@ int main() {
     ShowWindow(g_hwnd, SW_SHOW);
     UpdateWindow(g_hwnd);
 
-    std::cout << "[+] Window created successfully. Press 'q' or 'ESC' to exit.\n";
+    std::cout << "[+] Window created successfully.\n";
+    std::cout << "    [R]     Reset ReID Gallery\n";
+    std::cout << "    [ESC/Q] Exit\n";
 
     // Win32 Message Loop
     MSG msg;

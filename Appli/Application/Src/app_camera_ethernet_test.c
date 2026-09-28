@@ -217,6 +217,35 @@ void Ethernet_Streamer_UpdateDetections(
     }
 }
 
+/* Called from FX Task when a ReID embedding is ready (event-driven, ~1-2 FPS) */
+void Ethernet_Streamer_UpdateReID(
+    uint32_t frame_id,
+    const int8_t *embedding,
+    uint16_t embedding_len)
+{
+    if (stream_pcb == NULL || embedding == NULL || embedding_len == 0) return;
+
+    /* Cap embedding length to fit in our packet struct */
+    if (embedding_len > 128) embedding_len = 128;
+
+    uint16_t pkt_size = (uint16_t)(sizeof(uint32_t) + sizeof(uint8_t) + sizeof(uint8_t)
+                         + sizeof(uint16_t) + sizeof(uint32_t) + embedding_len);
+
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, pkt_size, PBUF_RAM);
+    if (p != NULL) {
+        ReidMetadataPacket_t *pkt = (ReidMetadataPacket_t *)p->payload;
+        pkt->magic         = STREAM_MAGIC;
+        pkt->pkt_type      = PKT_TYPE_REID_METADATA;
+        pkt->box_index     = 0;   /* Always top-1 detection for now */
+        pkt->embedding_len = embedding_len;
+        pkt->frame_id      = frame_id;
+        memcpy(pkt->embedding, embedding, embedding_len);
+
+        udp_sendto(stream_pcb, p, &target_ip, TARGET_PORT);
+        pbuf_free(p);
+    }
+}
+
 /* Backward compatibility wrapper */
 void Ethernet_Streamer_SendFrameWithDetections(
     const uint8_t *frame_buffer,
@@ -231,3 +260,4 @@ void Ethernet_Streamer_SendFrameWithDetections(
     Ethernet_Streamer_UpdateDetections(frame_id, inference_ms, num_boxes, boxes);
     Ethernet_Streamer_SendVideoFrame(frame_buffer, width, height, bpp, frame_id);
 }
+

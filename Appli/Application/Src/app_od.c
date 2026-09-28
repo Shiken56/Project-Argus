@@ -5,7 +5,10 @@
 
 #include "stm32n6xx_hal.h"
 #include "nnlib.h"
+#include "stai_od_model.h"
 #include "app_camera_ethernet_test.h"
+#include "app_image_utils.h"
+#include "app_fx.h"
 
 #define PRINT(fmt, ...) tm_printf((const UB *)(fmt), ##__VA_ARGS__)
 
@@ -14,14 +17,49 @@ extern uint8_t ml_buffer[];
 #define ML_WIDTH 256
 #define ML_HEIGHT 256
 
-/* Semaphore for OD task */
+/* =========================================================================
+ * Shared RTOS Resources (used by both od_task and fx_task)
+ * ========================================================================= */
+
+/* Semaphore for OD task — signaled by camera ISR */
 ID sem_od_frame_ready = -1;
 
-/* Static AI context */
+/* NPU mutex semaphore (count=1) — protects the single NPU hardware.
+ * Both od_task and fx_task must acquire this before calling nnlib_run_inference(). */
+ID sem_npu = -1;
+
+/* Mailbox for passing detection jobs from od_task to fx_task */
+ID mbx_od_to_fx = -1;
+
+/* Shared crop buffer for ReID input (128 x 256 x 3 = 98304 bytes).
+ * Placed in external 32MB PSRAM (.psram_bss) to save internal SRAM.
+ * od_task writes the cropped person into this buffer, then sends a mailbox
+ * message to fx_task which reads from it. Ordering is guaranteed by mailbox. */
+__attribute__((section(".psram_bss"))) __attribute__((aligned(32)))
+uint8_t reid_input_buf[128 * 256 * 3];  /* 98304 bytes = STAI_FX_MODEL_IN_1_SIZE_BYTES */
+
+/* Static AI context for OD model */
 STAI_NETWORK_CONTEXT_DECLARE(od_network, STAI_OD_MODEL_CONTEXT_SIZE);
 
 volatile bool npu_is_inferencing = false;
 volatile uint32_t npu_inf_start_tick = 0;
+
+/* Static mailbox message — valid until fx_task reads it.
+ * Using a single static instance is safe because od_task only sends
+ * a new message after the previous one has been picked up (mailbox depth=1). */
+static FxJobMsg_t s_fx_msg;
+
+/* OD model configuration with vtable */
+static nnlib_config_t od_nn_config = {
+    .network = od_network,
+    .external_weights_addr = (void*)0x71000000,
+    .vtable = {
+        .init        = stai_od_model_init,
+        .run         = stai_od_model_run,
+        .get_inputs  = stai_od_model_get_inputs,
+        .get_outputs = stai_od_model_get_outputs,
+    }
+};
 
 /* IoU Helper for Non-Maximum Suppression (NMS) */
 static float calculate_iou(float cx1, float cy1, float w1, float h1,
@@ -55,6 +93,9 @@ static float calculate_iou(float cx1, float cy1, float w1, float h1,
     return inter_area / union_area;
 }
 
+/* =========================================================================
+ * NPU Watchdog Task (unchanged)
+ * ========================================================================= */
 LOCAL void npu_watchdog_task(INT stacd, void *exinf) {
   (void)stacd;
   (void)exinf;
@@ -100,34 +141,55 @@ LOCAL T_CTSK ctsk_npu_wdg = {
     .tskatr = TA_HLNG | TA_RNG0,
 };
 
+/* =========================================================================
+ * OD Task — Object Detection (YOLOv8n)
+ * ========================================================================= */
 LOCAL void od_task(INT stacd, void *exinf) {
   (void)stacd;
   (void)exinf;
 
   PRINT("[OD] Starting OD Task...\r\n");
 
-  /* Create Semaphore */
-  T_CSEM csem = {.exinf = NULL, .sematr = TA_TFIFO, .isemcnt = 0, .maxsem = 1};
-  sem_od_frame_ready = tk_cre_sem(&csem);
+  /* --- Create RTOS Semaphores and Mailbox --- */
+
+  /* 1. Camera frame semaphore (existing) */
+  T_CSEM csem_frame = {.exinf = NULL, .sematr = TA_TFIFO, .isemcnt = 0, .maxsem = 1};
+  sem_od_frame_ready = tk_cre_sem(&csem_frame);
   if (sem_od_frame_ready <= 0) {
     PRINT("[OD ERROR] Failed to create OD semaphore\r\n");
     tk_ext_tsk();
     return;
   }
 
-  /* Setup NNLIB config */
-  nnlib_config_t nn_config = {
-      .network = od_network,
-      .external_weights_addr = (void*)0x71000000 /* NOR Flash address where model weights are stored */
-  };
+  /* 2. NPU mutex semaphore (NEW — shared with fx_task) */
+  T_CSEM csem_npu = {.exinf = NULL, .sematr = TA_TFIFO, .isemcnt = 1, .maxsem = 1};
+  sem_npu = tk_cre_sem(&csem_npu);
+  if (sem_npu <= 0) {
+    PRINT("[OD ERROR] Failed to create NPU semaphore\r\n");
+    tk_ext_tsk();
+    return;
+  }
 
-  /* Initialize Hardware and Model */
-  if (!nnlib_init(&nn_config)) {
+  /* 3. Mailbox for OD -> FX job passing (NEW) */
+  T_CMBX cmbx = {.exinf = NULL, .mbxatr = TA_TFIFO | TA_MFIFO};
+  mbx_od_to_fx = tk_cre_mbx(&cmbx);
+  if (mbx_od_to_fx <= 0) {
+    PRINT("[OD ERROR] Failed to create OD->FX mailbox\r\n");
+    tk_ext_tsk();
+    return;
+  }
+
+  /* --- Initialize Hardware and OD Model --- */
+  nnlib_hardware_init();        /* Clocks, flash, NPU IRQ — called once for all models */
+  if (!nnlib_init(&od_nn_config)) {
     PRINT("[OD ERROR] NNLIB Init Failed\r\n");
     tk_ext_tsk();
     return;
   }
-  PRINT("[OD] Model Initialized successfully!\r\n");
+  PRINT("[OD] YOLO Model Initialized successfully!\r\n");
+
+  /* --- Launch FX Task (after hardware and mailbox are ready) --- */
+  start_fx_task();
 
   uint32_t inf_count = 0;
   PRINT("[OD] Entering main inference loop...\r\n");
@@ -143,18 +205,22 @@ LOCAL void od_task(INT stacd, void *exinf) {
       continue;
     }
 
-    /* Copy frame to NPU input */
-    if (!nnlib_set_input(&nn_config, ml_buffer, ML_WIDTH * ML_HEIGHT * 3)) {
+    /* --- Acquire NPU, run YOLO --- */
+    tk_wai_sem(sem_npu, 1, TMO_FEVR);
+
+    if (!nnlib_set_input(&od_nn_config, ml_buffer, ML_WIDTH * ML_HEIGHT * 3)) {
         PRINT("[OD ERROR] Failed to set input buffer\r\n");
+        tk_sig_sem(sem_npu, 1);
         continue;
     }
 
-    /* Run Inference */
     uint32_t inf_ms = 0;
     npu_inf_start_tick = HAL_GetTick();
     npu_is_inferencing = true;
-    bool inf_ret = nnlib_run_inference(&nn_config, &inf_ms);
+    bool inf_ret = nnlib_run_inference(&od_nn_config, &inf_ms);
     npu_is_inferencing = false;
+
+    tk_sig_sem(sem_npu, 1);   /* Release NPU immediately after YOLO */
 
     if (!inf_ret) {
         PRINT("[OD ERROR] Inference Failed or Hanged!\r\n");
@@ -163,9 +229,9 @@ LOCAL void od_task(INT stacd, void *exinf) {
 
     inf_count++;
 
-    /* Get, Filter with NMS and Stream results */
+    /* --- Get, Filter with NMS and Stream results --- */
     float *bboxes = NULL;
-    if (nnlib_get_output(&nn_config, (void**)&bboxes) && bboxes != NULL) {
+    if (nnlib_get_output(&od_nn_config, (void**)&bboxes) && bboxes != NULL) {
         #define MAX_CANDIDATES 32
         DetectionBox_t candidates[MAX_CANDIDATES];
         bool suppressed[MAX_CANDIDATES] = {false};
@@ -236,6 +302,24 @@ LOCAL void od_task(INT stacd, void *exinf) {
                       (int)(detected_boxes[0].h * 1000.0f),
                       (unsigned long)inf_ms);
             }
+
+            /* --- Crop top-1 detection into shared reid_input_buf --- */
+            image_crop_resize_nn(
+                ml_buffer, ML_WIDTH, ML_HEIGHT,
+                detected_boxes[0].cx, detected_boxes[0].cy,
+                detected_boxes[0].w,  detected_boxes[0].h,
+                reid_input_buf, 128, 256
+            );
+
+            /* Send job to fx_task via mailbox (non-blocking for od_task) */
+            memset(&s_fx_msg.hdr, 0, sizeof(T_MSG));
+            s_fx_msg.frame_id     = inf_count;
+            s_fx_msg.num_detected = num_detected;
+            s_fx_msg.top_box      = detected_boxes[0];
+
+            /* Try to send — if mailbox is full (fx_task busy), skip this frame's ReID */
+            tk_snd_mbx(mbx_od_to_fx, (T_MSG*)&s_fx_msg);
+
         } else if (inf_count % 10 == 0) {
             PRINT("--- [NO DETECTION] Max Conf: %d%% (Threshold: 30%%) | Infer: %lu ms\r\n",
                   (int)(max_conf * 100.0f), (unsigned long)inf_ms);

@@ -44,8 +44,8 @@ _Min_Stack_Size = 0x800; /* required amount of stack */
 /* Memories definition */
 MEMORY
 {
-  ROM    (xrw)    : ORIGIN = 0x34000400,   LENGTH = 767K
-  RAM    (xrw)    : ORIGIN = 0x340C0000,   LENGTH = 1280K
+  ROM    (xrw)    : ORIGIN = 0x34000400,   LENGTH = 1151K
+  RAM    (xrw)    : ORIGIN = 0x34120000,   LENGTH = 896K
   PSRAM  (xrw)    : ORIGIN = 0x90000000,   LENGTH = 32M
 }
 
@@ -147,7 +147,7 @@ SECTIONS
 
   } >RAM AT> ROM
 
-  .noncacheable 0x34180000 (NOLOAD):
+  .noncacheable (NOLOAD):
   {
     . = ALIGN(32);
     __snoncacheable = .;/* create symbol for start of section */

@@ -9,6 +9,7 @@
 
 #define PKT_TYPE_VIDEO_CHUNK 1
 #define PKT_TYPE_OD_METADATA 2
+#define PKT_TYPE_REID_METADATA 3
 
 #pragma pack(push, 1)
 typedef struct {
@@ -41,6 +42,14 @@ typedef struct {
     uint16_t payload_len;   /* Length of byte array following header */
     uint32_t frame_id;      /* Synchronized with OdMetadataPacket_t */
 } VideoChunkHeader_t;
+typedef struct {
+    uint32_t magic;          /* STREAM_MAGIC (0x54524F4E) */
+    uint8_t  pkt_type;       /* PKT_TYPE_REID_METADATA (3) */
+    uint8_t  box_index;      /* 0 = best detection */
+    uint16_t embedding_len;  /* Length of embedding vector in bytes */
+    uint32_t frame_id;       /* Synchronized with video frame_id */
+    int8_t   embedding[128]; /* INT8 feature vector from OSNet */
+} ReidMetadataPacket_t;     /* 140 bytes total — fits in one UDP datagram */
 #pragma pack(pop)
 
 /* Initialize the UDP streamer connection and background RTOS task */
@@ -61,6 +70,13 @@ void Ethernet_Streamer_UpdateDetections(
     uint32_t inference_ms,
     uint8_t num_boxes,
     const DetectionBox_t *boxes
+);
+
+/* Send a ReID embedding packet from FX task (event-driven, ~1-2 FPS) */
+void Ethernet_Streamer_UpdateReID(
+    uint32_t frame_id,
+    const int8_t *embedding,
+    uint16_t embedding_len
 );
 
 /* Backward compatibility wrapper */

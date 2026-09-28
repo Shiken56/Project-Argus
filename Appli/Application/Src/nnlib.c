@@ -7,7 +7,16 @@
 
 #define PRINT(fmt, ...) tm_printf((const UB *)(fmt), ##__VA_ARGS__)
 
-static void NNLIB_Hardware_Init(void) {
+/* Track whether hardware has been initialized (call only once) */
+static bool s_hw_initialized = false;
+
+/* Track whether STAI runtime has been initialized (call only once) */
+static bool s_runtime_initialized = false;
+
+void nnlib_hardware_init(void) {
+  if (s_hw_initialized) return;
+  s_hw_initialized = true;
+
   /* 1. NPU Reset and Clock Enable */
   __HAL_RCC_CACHEAXI_CLK_ENABLE();
   __HAL_RCC_NPU_CLK_ENABLE();
@@ -77,18 +86,18 @@ bool nnlib_init(nnlib_config_t *config) {
     return false;
   }
 
-  /* Initialize Hardware (NPU + External Flash + RIF) */
-  NNLIB_Hardware_Init();
-
-  /* Initialize the ST Edge AI Runtime (Initializes ATON IPs, interrupts, and enables NPU0 IRQ) */
-  stai_return_code rt_ret = stai_runtime_init();
-  if (rt_ret != STAI_SUCCESS) {
-    PRINT("[NNLIB ERROR] STAI Runtime Init Failed: %d\r\n", rt_ret);
-    return false;
+  /* Initialize STAI Runtime once (shared across all models) */
+  if (!s_runtime_initialized) {
+    stai_return_code rt_ret = stai_runtime_init();
+    if (rt_ret != STAI_SUCCESS) {
+      PRINT("[NNLIB ERROR] STAI Runtime Init Failed: %d\r\n", rt_ret);
+      return false;
+    }
+    s_runtime_initialized = true;
   }
 
-  /* Initialize the AI Model */
-  stai_return_code ret = stai_od_model_init(config->network);
+  /* Initialize the AI Model via vtable */
+  stai_return_code ret = config->vtable.init(config->network);
   if (ret != STAI_SUCCESS) {
     PRINT("[NNLIB ERROR] Model Init Failed: %d\r\n", ret);
     return false;
@@ -101,7 +110,7 @@ bool nnlib_set_input(nnlib_config_t *config, void *input_data, uint32_t size) {
   stai_ptr inputs[1];
   stai_size num_inputs;
 
-  if (stai_od_model_get_inputs(config->network, inputs, &num_inputs) !=
+  if (config->vtable.get_inputs(config->network, inputs, &num_inputs) !=
       STAI_SUCCESS) {
     return false;
   }
@@ -117,7 +126,7 @@ bool nnlib_set_input(nnlib_config_t *config, void *input_data, uint32_t size) {
 bool nnlib_run_inference(nnlib_config_t *config, uint32_t *inference_time_ms) {
   uint32_t start_time = HAL_GetTick();
 
-  stai_return_code ret = stai_od_model_run(config->network, STAI_MODE_SYNC);
+  stai_return_code ret = config->vtable.run(config->network, STAI_MODE_SYNC);
 
   uint32_t end_time = HAL_GetTick();
 
@@ -136,7 +145,7 @@ bool nnlib_get_output(nnlib_config_t *config, void **output_data) {
   stai_ptr outputs[1];
   stai_size num_outputs;
 
-  if (stai_od_model_get_outputs(config->network, outputs, &num_outputs) !=
+  if (config->vtable.get_outputs(config->network, outputs, &num_outputs) !=
       STAI_SUCCESS) {
     return false;
   }
