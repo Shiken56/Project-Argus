@@ -15,6 +15,7 @@
 #include <cstring>
 #include <iomanip>
 #include <sstream>
+#include <atomic>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -28,8 +29,9 @@
 #define LISTEN_PORT 5000
 #define OD_MAX_BOXES 10
 #define REID_EMBEDDING_DIM 128
-#define REID_SIMILARITY_THRESHOLD 0.91f  // 91% threshold: clean separation for same person (>91%) vs others (~82%)
-#define REID_CONFIRMATION_COUNT   3      // Require 3 matching observations before confirming new person
+
+// Real-time tunable threshold (default 75%, adjustable live from 40% to 98%)
+static std::atomic<float> g_reid_similarity_threshold(0.75f);
 
 #pragma pack(push, 1)
 struct DetectionBox_t {
@@ -101,7 +103,6 @@ static const int NUM_ID_COLORS = sizeof(ID_COLORS) / sizeof(ID_COLORS[0]);
 struct PersonProfile {
     int id;
     std::vector<float> feature;              // L2 normalized representative feature vector
-    std::vector<std::vector<float>> history; // Rolling history of observed embeddings
     COLORREF color;
     uint32_t last_seen_frame;
     int match_count;
@@ -109,16 +110,20 @@ struct PersonProfile {
     std::chrono::steady_clock::time_point last_seen_time;
 };
 
-// Spatial Multi-Object Track Structure (mirrors ST's TrackObject)
+// ReID match score for a specific gallery person
+struct PersonMatchScore {
+    int person_id;
+    float sim;
+};
+
+// Spatial Multi-Object Track Structure (IoU tracking)
 struct ActiveTrack {
     int track_id;               // Sequential Track ID (1, 2, ...)
     int person_id;              // Confirmed Gallery Person ID (1, 2, ...) or 0 if unassigned
     float sim;                  // Last match similarity
     COLORREF color;             // Color associated with person or neutral
     DetectionBox_t box;         // Last known bounding box coordinates (cx, cy, w, h)
-    std::vector<float> feature; // Feature template for this track
-    bool has_feature;
-    int observation_count;      // Consecutive detections
+    std::vector<PersonMatchScore> all_scores; // Similarity score with each person in gallery
     std::chrono::steady_clock::time_point last_seen;
 };
 static std::vector<ActiveTrack> g_tracks;
@@ -202,91 +207,8 @@ static float compute_iou(const DetectionBox_t& a, const DetectionBox_t& b) {
     return inter_area / union_area;
 }
 
-// Cross-Identity Deduplication: Compare all gallery profiles and merge duplicate identities
-static void reconcile_and_merge_gallery(std::chrono::steady_clock::time_point now_t) {
-    if (g_gallery.size() < 2) return;
+// (Cross-identity gallery merging filter removed per configuration)
 
-    bool merged = true;
-    while (merged) {
-        merged = false;
-        for (size_t i = 0; i < g_gallery.size() && !merged; i++) {
-            for (size_t j = i + 1; j < g_gallery.size() && !merged; j++) {
-                // 1. Mean template similarity
-                float sim_mean = compute_cosine_similarity(g_gallery[i].feature, g_gallery[j].feature);
-
-                // 2. Cross history maximum similarity
-                float max_cross_sim = sim_mean;
-                for (const auto& f_i : g_gallery[i].history) {
-                    for (const auto& f_j : g_gallery[j].history) {
-                        float s = compute_cosine_similarity(f_i, f_j);
-                        if (s > max_cross_sim) max_cross_sim = s;
-                    }
-                }
-
-                // If cross similarity is high (>= 0.88f), they belong to the same person!
-                if (sim_mean >= 0.88f || max_cross_sim >= 0.90f) {
-                    int keep_idx = (int)i;
-                    int drop_idx = (int)j;
-
-                    // Prefer the identity with more observations/matches
-                    if (g_gallery[drop_idx].match_count > g_gallery[keep_idx].match_count) {
-                        std::swap(keep_idx, drop_idx);
-                    }
-
-                    int keep_id = g_gallery[keep_idx].id;
-                    int drop_id = g_gallery[drop_idx].id;
-
-                    // Merge feature via weighted average
-                    float w_keep = (float)std::max(1, g_gallery[keep_idx].match_count);
-                    float w_drop = (float)std::max(1, g_gallery[drop_idx].match_count);
-                    float total_w = w_keep + w_drop;
-
-                    for (size_t k = 0; k < g_gallery[keep_idx].feature.size(); k++) {
-                        g_gallery[keep_idx].feature[k] = (w_keep * g_gallery[keep_idx].feature[k] + w_drop * g_gallery[drop_idx].feature[k]) / total_w;
-                    }
-
-                    // Re-normalize merged feature
-                    float sum_sq = 0.0f;
-                    for (float v : g_gallery[keep_idx].feature) sum_sq += v * v;
-                    float n_val = std::sqrt(sum_sq);
-                    if (n_val > 1e-6f) {
-                        for (float &v : g_gallery[keep_idx].feature) v /= n_val;
-                    }
-
-                    // Merge histories (keep up to 10 latest)
-                    for (const auto& h : g_gallery[drop_idx].history) {
-                        g_gallery[keep_idx].history.push_back(h);
-                    }
-                    if (g_gallery[keep_idx].history.size() > 10) {
-                        g_gallery[keep_idx].history.erase(g_gallery[keep_idx].history.begin(),
-                                                          g_gallery[keep_idx].history.begin() + (g_gallery[keep_idx].history.size() - 10));
-                    }
-
-                    g_gallery[keep_idx].match_count += g_gallery[drop_idx].match_count;
-                    if (g_gallery[drop_idx].last_seen_time > g_gallery[keep_idx].last_seen_time) {
-                        g_gallery[keep_idx].last_seen_time = g_gallery[drop_idx].last_seen_time;
-                        g_gallery[keep_idx].last_seen_frame = g_gallery[drop_idx].last_seen_frame;
-                    }
-
-                    // Reassign all active tracks pointing to drop_id -> keep_id
-                    for (auto& trk : g_tracks) {
-                        if (trk.person_id == drop_id) {
-                            trk.person_id = keep_id;
-                            trk.color = g_gallery[keep_idx].color;
-                            trk.feature = g_gallery[keep_idx].feature;
-                        }
-                    }
-
-                    std::cout << "[MERGE FILTER] Deduplication: Consolidated duplicate Person #" << drop_id
-                              << " into Person #" << keep_id << " (sim=" << (int)(max_cross_sim * 100.0f) << "%)\n";
-
-                    g_gallery.erase(g_gallery.begin() + drop_idx);
-                    merged = true; // Repeat until clean
-                }
-            }
-        }
-    }
-}
 
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -342,8 +264,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             char bannerText[256];
             snprintf(bannerText, sizeof(bannerText),
-                     "  STM32N6 EDGE-AI | Frame #%u | Video: %.1f FPS | YOLO: %u ms | Tracks: %u | Thresh: %.0f%%",
-                     frame_id, fps, (unsigned int)meta.inference_ms, (unsigned int)tracks_copy.size(), REID_SIMILARITY_THRESHOLD * 100.0f);
+                     "  STM32N6 EDGE-AI | Frame #%u | Video: %.1f FPS | YOLO: %u ms | Tracks: %u | Thresh: %.0f%% (Scroll to tune)",
+                     frame_id, fps, (unsigned int)meta.inference_ms, (unsigned int)tracks_copy.size(), g_reid_similarity_threshold.load() * 100.0f);
 
             SetTextColor(memDC, RGB(0, 240, 255));
             SetBkMode(memDC, TRANSPARENT);
@@ -434,6 +356,44 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 SetTextColor(memDC, RGB(0, 0, 0));
                 DrawTextA(memDC, label, -1, &labelRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
 
+                // Corner Badge: small text list of similarity scores against all gallery persons (e.g. p1 - 85%, p2 - 42%)
+                if (assigned_track >= 0 && assigned_track < (int)tracks_copy.size()) {
+                    const auto& trk = tracks_copy[assigned_track];
+                    if (!trk.all_scores.empty()) {
+                        int num_scores = (int)trk.all_scores.size();
+                        int badge_w = 72;
+                        int badge_h = num_scores * 15 + 4;
+                        // Position badge inside the top-right corner of the bounding box (or top-left if box is near right edge)
+                        int badge_x = (x2 - badge_w - 4 >= x1) ? (x2 - badge_w - 4) : (x1 + 4);
+                        int badge_y = y1 + 4;
+
+                        RECT badgeRect = {badge_x, badge_y, badge_x + badge_w, badge_y + badge_h};
+                        HBRUSH badgeBg = CreateSolidBrush(RGB(15, 20, 28));
+                        FillRect(memDC, &badgeRect, badgeBg);
+                        DeleteObject(badgeBg);
+
+                        HPEN badgePen = CreatePen(PS_SOLID, 1, RGB(48, 54, 61));
+                        SelectObject(memDC, badgePen);
+                        SelectObject(memDC, GetStockObject(HOLLOW_BRUSH));
+                        Rectangle(memDC, badgeRect.left, badgeRect.top, badgeRect.right, badgeRect.bottom);
+                        SelectObject(memDC, oldPen);
+                        DeleteObject(badgePen);
+
+                        float live_thresh = g_reid_similarity_threshold.load();
+                        int row_y = badge_y + 2;
+                        for (const auto& ms : trk.all_scores) {
+                            char scoreStr[32];
+                            snprintf(scoreStr, sizeof(scoreStr), "p%d - %d%%", ms.person_id, (int)(ms.sim * 100.0f));
+                            RECT scoreRowRect = {badge_x + 5, row_y, badge_x + badge_w - 3, row_y + 14};
+                            // Highlight in bright green if >= threshold, else light grey
+                            COLORREF textColor = (ms.sim >= live_thresh) ? RGB(50, 255, 120) : RGB(180, 190, 200);
+                            SetTextColor(memDC, textColor);
+                            DrawTextA(memDC, scoreStr, -1, &scoreRowRect, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
+                            row_y += 15;
+                        }
+                    }
+                }
+
                 // Bottom coordinates tag
                 char coordStr[64];
                 snprintf(coordStr, sizeof(coordStr), "cx=%.2f cy=%.2f w=%.2f h=%.2f",
@@ -467,12 +427,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             LineTo(memDC, TOTAL_W - 10, HEADER_H + 32);
 
             int cardY = HEADER_H + 38;
-            for (size_t i = 0; i < gallery_copy.size() && i < 4; i++) {
+            for (size_t i = 0; i < gallery_copy.size() && i < 2; i++) {
                 const auto& p = gallery_copy[i];
                 double age = std::chrono::duration<double>(now - p.last_seen_time).count();
                 bool is_active = (age < 3.0);
 
-                RECT cardRect = {DISP_W + 12, cardY, TOTAL_W - 12, cardY + 50};
+                RECT cardRect = {DISP_W + 12, cardY, TOTAL_W - 12, cardY + 44};
                 HBRUSH cardBg = CreateSolidBrush(is_active ? RGB(26, 33, 44) : RGB(22, 27, 34));
                 FillRect(memDC, &cardRect, cardBg);
                 DeleteObject(cardBg);
@@ -485,7 +445,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 DeleteObject(borderPen);
 
                 // Accent Pill
-                RECT pillRect = {cardRect.left + 8, cardRect.top + 8, cardRect.left + 14, cardRect.bottom - 8};
+                RECT pillRect = {cardRect.left + 8, cardRect.top + 6, cardRect.left + 14, cardRect.bottom - 6};
                 HBRUSH pillBrush = CreateSolidBrush(p.color);
                 FillRect(memDC, &pillRect, pillBrush);
                 DeleteObject(pillBrush);
@@ -493,30 +453,121 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 // Header
                 char idHeader[64];
                 snprintf(idHeader, sizeof(idHeader), "Person #%d  %s", p.id, is_active ? "[ACTIVE]" : "[LOST]");
-                RECT idTextRect = {cardRect.left + 22, cardRect.top + 6, cardRect.right - 8, cardRect.top + 24};
+                RECT idTextRect = {cardRect.left + 22, cardRect.top + 4, cardRect.right - 8, cardRect.top + 20};
                 SetTextColor(memDC, is_active ? p.color : RGB(140, 140, 140));
                 DrawTextA(memDC, idHeader, -1, &idTextRect, DT_SINGLELINE | DT_LEFT);
 
                 // Stats
                 char statsText[128];
-                snprintf(statsText, sizeof(statsText), "Matches: %d  |  Last Sim: %d%%  |  Frame #%u",
-                         p.match_count, (int)(p.last_similarity * 100.0f), p.last_seen_frame);
-                RECT statsRect = {cardRect.left + 22, cardRect.top + 26, cardRect.right - 8, cardRect.bottom - 6};
+                snprintf(statsText, sizeof(statsText), "Matches: %d  |  Last Sim: %d%%",
+                         p.match_count, (int)(p.last_similarity * 100.0f));
+                RECT statsRect = {cardRect.left + 22, cardRect.top + 22, cardRect.right - 8, cardRect.bottom - 4};
                 SetTextColor(memDC, RGB(139, 148, 158));
                 DrawTextA(memDC, statsText, -1, &statsRect, DT_SINGLELINE | DT_LEFT);
 
-                cardY += 56;
+                cardY += 48;
             }
 
             if (gallery_copy.empty()) {
-                RECT noGalleryRect = {DISP_W + 12, cardY + 10, TOTAL_W - 12, cardY + 40};
+                RECT noGalleryRect = {DISP_W + 12, cardY + 4, TOTAL_W - 12, cardY + 28};
                 SetTextColor(memDC, RGB(110, 118, 129));
                 DrawTextA(memDC, "Awaiting person detections...", -1, &noGalleryRect, DT_LEFT);
-                cardY += 45;
+                cardY += 32;
             }
 
-            // Sidebar Section 2: Live 128-Byte Embedding Inspector
-            int embY = std::max(cardY + 10, HEADER_H + 250);
+            // Sidebar Section 2: Real-time Tunable Matching Threshold Card
+            float cur_thresh = g_reid_similarity_threshold.load();
+            int ctrlY = (std::max)(cardY + 8, HEADER_H + 95);
+            RECT ctrlCard = {DISP_W + 12, ctrlY, TOTAL_W - 12, ctrlY + 100};
+            HBRUSH ctrlBg = CreateSolidBrush(RGB(22, 27, 34));
+            FillRect(memDC, &ctrlCard, ctrlBg);
+            DeleteObject(ctrlBg);
+
+            HPEN ctrlBorder = CreatePen(PS_SOLID, 1, RGB(0, 180, 216));
+            SelectObject(memDC, ctrlBorder);
+            SelectObject(memDC, GetStockObject(HOLLOW_BRUSH));
+            Rectangle(memDC, ctrlCard.left, ctrlCard.top, ctrlCard.right, ctrlCard.bottom);
+            SelectObject(memDC, oldPen);
+            DeleteObject(ctrlBorder);
+
+            // Threshold Title & Value
+            char threshTitle[128];
+            snprintf(threshTitle, sizeof(threshTitle), "MATCH THRESHOLD: %d%%", (int)(cur_thresh * 100.0f));
+            RECT threshTitleRect = {ctrlCard.left + 10, ctrlY + 8, ctrlCard.right - 10, ctrlY + 26};
+            SetTextColor(memDC, RGB(0, 240, 255));
+            DrawTextA(memDC, threshTitle, -1, &threshTitleRect, DT_SINGLELINE | DT_LEFT);
+
+            RECT hintRect = {ctrlCard.left + 10, ctrlY + 24, ctrlCard.right - 10, ctrlY + 38};
+            SetTextColor(memDC, RGB(139, 148, 158));
+            DrawTextA(memDC, "Scroll wheel / click buttons / drag", -1, &hintRect, DT_SINGLELINE | DT_LEFT);
+
+            // [-] Button
+            RECT btnMinus = {ctrlCard.left + 10, ctrlY + 42, ctrlCard.left + 42, ctrlY + 66};
+            HBRUSH btnMinusBg = CreateSolidBrush(RGB(35, 42, 54));
+            FillRect(memDC, &btnMinus, btnMinusBg);
+            DeleteObject(btnMinusBg);
+            HPEN btnPen = CreatePen(PS_SOLID, 1, RGB(68, 76, 86));
+            SelectObject(memDC, btnPen);
+            SelectObject(memDC, GetStockObject(HOLLOW_BRUSH));
+            Rectangle(memDC, btnMinus.left, btnMinus.top, btnMinus.right, btnMinus.bottom);
+            SetTextColor(memDC, RGB(255, 255, 255));
+            DrawTextA(memDC, "-", -1, &btnMinus, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+
+            // Slider Track
+            int trackLeft = ctrlCard.left + 50;
+            int trackRight = ctrlCard.right - 50;
+            int trackWidth = trackRight - trackLeft;
+            RECT sliderTrack = {trackLeft, ctrlY + 50, trackRight, ctrlY + 58};
+            HBRUSH trackBg = CreateSolidBrush(RGB(40, 48, 60));
+            FillRect(memDC, &sliderTrack, trackBg);
+            DeleteObject(trackBg);
+
+            // Fill Track up to current threshold
+            float fillRatio = (cur_thresh - 0.40f) / (0.95f - 0.40f);
+            if (fillRatio < 0.0f) fillRatio = 0.0f;
+            if (fillRatio > 1.0f) fillRatio = 1.0f;
+            int fillW = (int)(fillRatio * trackWidth);
+            RECT sliderFill = {trackLeft, ctrlY + 50, trackLeft + fillW, ctrlY + 58};
+            HBRUSH fillBg = CreateSolidBrush(RGB(0, 200, 240));
+            FillRect(memDC, &sliderFill, fillBg);
+            DeleteObject(fillBg);
+
+            // Slider Handle knob
+            RECT knob = {trackLeft + fillW - 4, ctrlY + 46, trackLeft + fillW + 4, ctrlY + 62};
+            HBRUSH knobBrush = CreateSolidBrush(RGB(255, 255, 255));
+            FillRect(memDC, &knob, knobBrush);
+            DeleteObject(knobBrush);
+
+            // [+] Button
+            RECT btnPlus = {ctrlCard.right - 42, ctrlY + 42, ctrlCard.right - 10, ctrlY + 66};
+            HBRUSH btnPlusBg = CreateSolidBrush(RGB(35, 42, 54));
+            FillRect(memDC, &btnPlus, btnPlusBg);
+            DeleteObject(btnPlusBg);
+            Rectangle(memDC, btnPlus.left, btnPlus.top, btnPlus.right, btnPlus.bottom);
+            SetTextColor(memDC, RGB(255, 255, 255));
+            DrawTextA(memDC, "+", -1, &btnPlus, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+            SelectObject(memDC, oldPen);
+            DeleteObject(btnPen);
+
+            // Preset Buttons: [60%] [70%] [75%] [80%] [88%]
+            const int presets[] = {60, 70, 75, 80, 88};
+            int pStartX = ctrlCard.left + 10;
+            int pW = 50;
+            int pGap = 6;
+            for (int pi = 0; pi < 5; pi++) {
+                RECT pRect = {pStartX + pi * (pW + pGap), ctrlY + 72, pStartX + pi * (pW + pGap) + pW, ctrlY + 92};
+                bool is_selected = (std::abs(cur_thresh * 100.0f - presets[pi]) < 1.0f);
+                HBRUSH pBg = CreateSolidBrush(is_selected ? RGB(0, 119, 182) : RGB(30, 36, 46));
+                FillRect(memDC, &pRect, pBg);
+                DeleteObject(pBg);
+                char pTxt[16];
+                snprintf(pTxt, sizeof(pTxt), "%d%%", presets[pi]);
+                SetTextColor(memDC, is_selected ? RGB(255, 255, 255) : RGB(170, 180, 195));
+                DrawTextA(memDC, pTxt, -1, &pRect, DT_SINGLELINE | DT_CENTER | DT_VCENTER);
+            }
+
+            // Sidebar Section 3: Live 128-Byte Embedding Inspector
+            int embY = ctrlY + 108;
             RECT embTitleRect = {DISP_W + 12, embY, TOTAL_W - 12, embY + 18};
             SetTextColor(memDC, RGB(0, 240, 255));
             char embHeader[64];
@@ -527,8 +578,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             LineTo(memDC, TOTAL_W - 10, embY + 22);
 
             // Display sample rows of 128-byte INT8 embedding
-            int rowY = embY + 28;
-            for (int row = 0; row < 8 && row * 16 < REID_EMBEDDING_DIM; row++) {
+            int rowY = embY + 26;
+            for (int row = 0; row < 7 && row * 16 < REID_EMBEDDING_DIM; row++) {
                 char rowStr[128] = {};
                 int offset = 0;
                 offset += snprintf(rowStr + offset, sizeof(rowStr) - offset, "[%02d..%02d] ", row * 16, row * 16 + 15);
@@ -536,21 +587,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     int idx = row * 16 + col;
                     offset += snprintf(rowStr + offset, sizeof(rowStr) - offset, "%4d", (int)latest_emb[idx]);
                 }
-                RECT rowRect = {DISP_W + 12, rowY, TOTAL_W - 12, rowY + 16};
+                RECT rowRect = {DISP_W + 12, rowY, TOTAL_W - 12, rowY + 15};
                 SetTextColor(memDC, RGB(180, 190, 205));
                 DrawTextA(memDC, rowStr, -1, &rowRect, DT_SINGLELINE | DT_LEFT);
-                rowY += 16;
+                rowY += 15;
             }
 
             // Bottom Controls Banner
-            RECT diagRect = {DISP_W + 12, TOTAL_H - 50, TOTAL_W - 12, TOTAL_H - 10};
+            RECT diagRect = {DISP_W + 12, TOTAL_H - 52, TOTAL_W - 12, TOTAL_H - 8};
             HBRUSH diagBg = CreateSolidBrush(RGB(13, 17, 23));
             FillRect(memDC, &diagRect, diagBg);
             DeleteObject(diagBg);
 
             char diagStr[128];
             snprintf(diagStr, sizeof(diagStr),
-                     "[R] Reset Gallery Identities\n[ESC/Q] Exit Application");
+                     "[UP/DN/Wheel] Thresh  [0] Reset Thresh\n[R] Reset Gallery     [ESC/Q] Exit");
             SetTextColor(memDC, RGB(110, 118, 129));
             DrawTextA(memDC, diagStr, -1, &diagRect, DT_LEFT);
 
@@ -567,8 +618,88 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
+        case WM_LBUTTONDOWN: {
+            int mx = LOWORD(lParam);
+            int my = HIWORD(lParam);
+
+            // Check if clicked in threshold card (x: DISP_W + 12 to TOTAL_W - 12)
+            if (mx >= DISP_W + 12 && mx <= TOTAL_W - 12 && my >= 130 && my <= 260) {
+                float cur = g_reid_similarity_threshold.load();
+
+                // 1. [-] Button (x: DISP_W + 22 to DISP_W + 54, y: 172 to 198)
+                if (mx >= DISP_W + 22 && mx <= DISP_W + 54 && my >= 170 && my <= 200) {
+                    cur -= 0.02f;
+                }
+                // 2. [+] Button (x: TOTAL_W - 54 to TOTAL_W - 22, y: 172 to 198)
+                else if (mx >= TOTAL_W - 54 && mx <= TOTAL_W - 22 && my >= 170 && my <= 200) {
+                    cur += 0.02f;
+                }
+                // 3. Slider Track (x: DISP_W + 62 to TOTAL_W - 62, y: 172 to 200)
+                else if (mx >= DISP_W + 62 && mx <= TOTAL_W - 62 && my >= 170 && my <= 200) {
+                    float ratio = (float)(mx - (DISP_W + 62)) / (float)((TOTAL_W - 62) - (DISP_W + 62));
+                    cur = 0.40f + ratio * (0.95f - 0.40f);
+                }
+                // 4. Presets (y: 202 to 226): [60%] [70%] [75%] [80%] [88%]
+                else if (my >= 202 && my <= 226) {
+                    int pStartX = DISP_W + 22;
+                    int pW = 50;
+                    int pGap = 6;
+                    const float preset_vals[] = {0.60f, 0.70f, 0.75f, 0.80f, 0.88f};
+                    for (int pi = 0; pi < 5; pi++) {
+                        int bx = pStartX + pi * (pW + pGap);
+                        if (mx >= bx && mx <= bx + pW) {
+                            cur = preset_vals[pi];
+                            break;
+                        }
+                    }
+                }
+
+                cur = (std::max)(0.40f, (std::min)(0.98f, cur));
+                g_reid_similarity_threshold.store(cur);
+                std::cout << "[CONFIG] ReID Threshold changed to " << (int)(cur * 100.0f) << "%\n";
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        }
+
+        case WM_MOUSEWHEEL: {
+            short zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
+            float cur = g_reid_similarity_threshold.load();
+            if (zDelta > 0) cur += 0.01f;
+            else if (zDelta < 0) cur -= 0.01f;
+            cur = (std::max)(0.40f, (std::min)(0.98f, cur));
+            g_reid_similarity_threshold.store(cur);
+            std::cout << "[CONFIG] ReID Threshold changed to " << (int)(cur * 100.0f) << "%\n";
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
+
         case WM_KEYDOWN: {
-            if (wParam == 'R' || wParam == 'r') {
+            if (wParam == VK_UP || wParam == VK_RIGHT || wParam == VK_OEM_PLUS || wParam == 0xBB) {
+                float cur = (std::min)(0.98f, g_reid_similarity_threshold.load() + 0.01f);
+                g_reid_similarity_threshold.store(cur);
+                std::cout << "[CONFIG] ReID Threshold set to " << (int)(cur * 100.0f) << "%\n";
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (wParam == VK_DOWN || wParam == VK_LEFT || wParam == VK_OEM_MINUS || wParam == 0xBD) {
+                float cur = (std::max)(0.40f, g_reid_similarity_threshold.load() - 0.01f);
+                g_reid_similarity_threshold.store(cur);
+                std::cout << "[CONFIG] ReID Threshold set to " << (int)(cur * 100.0f) << "%\n";
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (wParam == VK_PRIOR) { // Page Up
+                float cur = (std::min)(0.98f, g_reid_similarity_threshold.load() + 0.05f);
+                g_reid_similarity_threshold.store(cur);
+                std::cout << "[CONFIG] ReID Threshold set to " << (int)(cur * 100.0f) << "%\n";
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (wParam == VK_NEXT) { // Page Down
+                float cur = (std::max)(0.40f, g_reid_similarity_threshold.load() - 0.05f);
+                g_reid_similarity_threshold.store(cur);
+                std::cout << "[CONFIG] ReID Threshold set to " << (int)(cur * 100.0f) << "%\n";
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (wParam == '0') { // Reset to default 75%
+                g_reid_similarity_threshold.store(0.75f);
+                std::cout << "[CONFIG] ReID Threshold reset to default 75%\n";
+                InvalidateRect(hwnd, NULL, FALSE);
+            } else if (wParam == 'R' || wParam == 'r') {
                 EnterCriticalSection(&g_cs);
                 g_gallery.clear();
                 g_tracks.clear();
@@ -625,7 +756,8 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
     std::cout << "  STM32N6 Object Detection & ReID Viewer Server          \n";
     std::cout << "=========================================================\n";
     std::cout << "[+] UDP Server listening on port " << LISTEN_PORT << "...\n";
-    std::cout << "[+] ReID Matching Threshold: " << (int)(REID_SIMILARITY_THRESHOLD * 100.0f) << "%\n";
+    std::cout << "[+] ReID Matching Threshold: " << (int)(g_reid_similarity_threshold.load() * 100.0f) << "%\n";
+    std::cout << "    Use Mouse Wheel or Up/Down arrows to adjust in real-time!\n";
 
     std::vector<uint8_t> recv_buf(2048);
     std::vector<uint8_t> raw_frame_565(FRAME_W * FRAME_H * 2, 0);
@@ -687,8 +819,6 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
                 new_t.sim = 0.0f;
                 new_t.color = RGB(160, 160, 160);
                 new_t.box = reid_pkt.box;
-                new_t.has_feature = false;
-                new_t.observation_count = 0;
                 new_t.last_seen = now_t;
                 g_tracks.push_back(new_t);
                 matched_track_idx = (int)g_tracks.size() - 1;
@@ -698,13 +828,24 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
             trk.box = reid_pkt.box;
             trk.last_seen = now_t;
 
-            // Check cosine similarity against confirmed gallery profiles
+            // Pure Cosine Similarity matching against gallery profiles using dynamic threshold
+            float live_threshold = g_reid_similarity_threshold.load();
             int best_gallery_id = -1;
             float best_gallery_sim = -1.0f;
             int best_gallery_idx = -1;
 
+            trk.all_scores.clear();
+            std::string scores_log = "[";
+
             for (size_t i = 0; i < g_gallery.size(); i++) {
-                // Mutual exclusion: Check if another active track is already assigned this gallery person_id
+                float sim = compute_cosine_similarity(g_gallery[i].feature, norm_emb);
+                trk.all_scores.push_back({g_gallery[i].id, sim});
+
+                char scBuf[32];
+                snprintf(scBuf, sizeof(scBuf), "p%d:%d%%%s", g_gallery[i].id, (int)(sim * 100.0f), (i + 1 < g_gallery.size()) ? ", " : "");
+                scores_log += scBuf;
+
+                // Mutual exclusion: Ensure two active tracks don't claim the same person simultaneously
                 bool in_use_by_other = false;
                 for (size_t other_t = 0; other_t < g_tracks.size(); other_t++) {
                     if ((int)other_t != matched_track_idx && g_tracks[other_t].person_id == g_gallery[i].id) {
@@ -717,30 +858,24 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
                 }
                 if (in_use_by_other) continue;
 
-                float sim = compute_cosine_similarity(g_gallery[i].feature, norm_emb);
                 if (sim > best_gallery_sim) {
                     best_gallery_sim = sim;
                     best_gallery_id = g_gallery[i].id;
                     best_gallery_idx = (int)i;
                 }
             }
+            scores_log += "]";
 
-            if (best_gallery_sim >= REID_SIMILARITY_THRESHOLD && best_gallery_idx >= 0) {
-                // Match confirmed in Gallery: update gallery template via EMA
+            if (best_gallery_sim >= live_threshold && best_gallery_idx >= 0) {
+                // Match confirmed in Gallery: update gallery template feature via simple EMA
                 for (size_t i = 0; i < norm_emb.size(); i++) {
-                    g_gallery[best_gallery_idx].feature[i] = 0.90f * g_gallery[best_gallery_idx].feature[i] + 0.10f * norm_emb[i];
+                    g_gallery[best_gallery_idx].feature[i] = 0.85f * g_gallery[best_gallery_idx].feature[i] + 0.15f * norm_emb[i];
                 }
                 float s_sq = 0.0f;
                 for (float v : g_gallery[best_gallery_idx].feature) s_sq += v * v;
                 float n_val = std::sqrt(s_sq);
                 if (n_val > 1e-6f) {
                     for (float &v : g_gallery[best_gallery_idx].feature) v /= n_val;
-                }
-
-                // Add to rolling history of recent embeddings
-                g_gallery[best_gallery_idx].history.push_back(norm_emb);
-                if (g_gallery[best_gallery_idx].history.size() > 10) {
-                    g_gallery[best_gallery_idx].history.erase(g_gallery[best_gallery_idx].history.begin());
                 }
 
                 g_gallery[best_gallery_idx].match_count++;
@@ -751,111 +886,34 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
                 trk.person_id = best_gallery_id;
                 trk.sim = best_gallery_sim;
                 trk.color = g_gallery[best_gallery_idx].color;
-                trk.feature = g_gallery[best_gallery_idx].feature;
-                trk.has_feature = true;
-                trk.observation_count++;
 
                 std::cout << "[RX REID] Track #" << trk.track_id << " (crop box " << box_idx << ") | frame #" << reid_pkt.frame_id
-                          << " ==> [MATCH] Person #" << best_gallery_id
+                          << " " << scores_log << " ==> [MATCH] Person #" << best_gallery_id
                           << " (sim=" << (int)(best_gallery_sim * 100.0f) << "% >= "
-                          << (int)(REID_SIMILARITY_THRESHOLD * 100.0f) << "%)\n";
+                          << (int)(live_threshold * 100.0f) << "%)\n";
             } else {
-                // No match with existing gallery profiles
-                if (!trk.has_feature) {
-                    trk.feature = norm_emb;
-                    trk.has_feature = true;
-                    trk.observation_count = 1;
-                    trk.sim = 1.0f;
-                    std::cout << "[RX REID] Track #" << trk.track_id << " (crop box " << box_idx << ") | frame #" << reid_pkt.frame_id
-                              << " ==> [NEW CANDIDATE] observation 1/" << REID_CONFIRMATION_COUNT << "\n";
-                } else {
-                    float self_sim = compute_cosine_similarity(trk.feature, norm_emb);
-                    if (self_sim >= 0.85f) {
-                        for (size_t i = 0; i < norm_emb.size(); i++) {
-                            trk.feature[i] = 0.90f * trk.feature[i] + 0.10f * norm_emb[i];
-                        }
-                        float s_sq = 0.0f;
-                        for (float v : trk.feature) s_sq += v * v;
-                        float n_val = std::sqrt(s_sq);
-                        if (n_val > 1e-6f) {
-                            for (float &v : trk.feature) v /= n_val;
-                        }
-                        trk.observation_count++;
-                        trk.sim = self_sim;
+                // Direct new person creation without waiting or buffering
+                int new_id = (int)g_gallery.size() + 1;
+                COLORREF color = ID_COLORS[(new_id - 1) % NUM_ID_COLORS];
+                PersonProfile p;
+                p.id = new_id;
+                p.feature = norm_emb;
+                p.color = color;
+                p.last_seen_frame = reid_pkt.frame_id;
+                p.match_count = 1;
+                p.last_similarity = (best_gallery_sim > 0.0f) ? best_gallery_sim : 1.0f;
+                p.last_seen_time = now_t;
+                g_gallery.push_back(p);
 
-                        if (trk.observation_count >= REID_CONFIRMATION_COUNT && trk.person_id == 0) {
-                            // Pre-promotion cross-check: Does this candidate match ANY existing gallery person's history?
-                            int pre_match_id = -1;
-                            int pre_match_idx = -1;
-                            float pre_match_sim = -1.0f;
-                            for (size_t gi = 0; gi < g_gallery.size(); gi++) {
-                                float s_mean = compute_cosine_similarity(g_gallery[gi].feature, trk.feature);
-                                if (s_mean > pre_match_sim) {
-                                    pre_match_sim = s_mean;
-                                    pre_match_id = g_gallery[gi].id;
-                                    pre_match_idx = (int)gi;
-                                }
-                                for (const auto& h_emb : g_gallery[gi].history) {
-                                    float s_hist = compute_cosine_similarity(h_emb, trk.feature);
-                                    if (s_hist > pre_match_sim) {
-                                        pre_match_sim = s_hist;
-                                        pre_match_id = g_gallery[gi].id;
-                                        pre_match_idx = (int)gi;
-                                    }
-                                }
-                            }
+                trk.person_id = new_id;
+                trk.sim = 1.0f;
+                trk.color = color;
 
-                            if (pre_match_sim >= 0.88f && pre_match_idx >= 0) {
-                                // Snap candidate to existing person instead of spawning a duplicate
-                                trk.person_id = pre_match_id;
-                                trk.color = g_gallery[pre_match_idx].color;
-                                trk.feature = g_gallery[pre_match_idx].feature;
-                                g_gallery[pre_match_idx].history.push_back(trk.feature);
-                                if (g_gallery[pre_match_idx].history.size() > 10) {
-                                    g_gallery[pre_match_idx].history.erase(g_gallery[pre_match_idx].history.begin());
-                                }
-                                std::cout << "[RX REID] Track #" << trk.track_id
-                                          << " ==> Snapped to existing Person #" << pre_match_id
-                                          << " (pre-promotion sim=" << (int)(pre_match_sim * 100.0f) << "%)\n";
-                            } else {
-                                // Confirmed new person! Promote to gallery
-                                int new_id = (int)g_gallery.size() + 1;
-                                COLORREF color = ID_COLORS[(new_id - 1) % NUM_ID_COLORS];
-                                PersonProfile p;
-                                p.id = new_id;
-                                p.feature = trk.feature;
-                                p.history.push_back(trk.feature);
-                                p.color = color;
-                                p.last_seen_frame = reid_pkt.frame_id;
-                                p.match_count = trk.observation_count;
-                                p.last_similarity = self_sim;
-                                p.last_seen_time = now_t;
-                                g_gallery.push_back(p);
-
-                                trk.person_id = new_id;
-                                trk.color = color;
-
-                                std::cout << "[RX REID] Track #" << trk.track_id << " | frame #" << reid_pkt.frame_id
-                                          << " ==> [CONFIRMED PERSON #" << new_id << "] after "
-                                          << REID_CONFIRMATION_COUNT << " observations (self_sim="
-                                          << (int)(self_sim * 100.0f) << "%)\n";
-                            }
-                        } else {
-                            std::cout << "[RX REID] Track #" << trk.track_id << " | frame #" << reid_pkt.frame_id
-                                      << " ==> [CANDIDATE] observation " << trk.observation_count
-                                      << "/" << REID_CONFIRMATION_COUNT << " (self_sim="
-                                      << (int)(self_sim * 100.0f) << "%)\n";
-                        }
-                    } else {
-                        // Sudden feature change on track, reset template
-                        trk.feature = norm_emb;
-                        trk.observation_count = 1;
-                    }
-                }
+                std::cout << "[RX REID] Track #" << trk.track_id << " (crop box " << box_idx << ") | frame #" << reid_pkt.frame_id
+                          << " " << scores_log << " ==> [NEW PERSON #" << new_id << "] (best_sim="
+                          << (int)(best_gallery_sim * 100.0f) << "% < "
+                          << (int)(live_threshold * 100.0f) << "%)\n";
             }
-
-            // Periodically run cross-identity deduplication
-            reconcile_and_merge_gallery(now_t);
 
             g_raw_latest_embedding.assign(reid_pkt.embedding, reid_pkt.embedding + emb_len);
             g_latest_reid_box = box_idx;
@@ -903,8 +961,6 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
                     new_t.sim = 0.0f;
                     new_t.color = RGB(160, 160, 160);
                     new_t.box = current_meta.boxes[i];
-                    new_t.has_feature = false;
-                    new_t.observation_count = 0;
                     new_t.last_seen = now_t;
                     g_tracks.push_back(new_t);
                 }

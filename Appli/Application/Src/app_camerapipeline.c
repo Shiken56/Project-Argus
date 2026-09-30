@@ -90,7 +90,7 @@ static void DCMIPP_PipeInitNn(uint32_t *pitch)
   dcmipp_conf.output_format = DCMIPP_PIXEL_PACKER_FORMAT_RGB888_YUV444_1;
   dcmipp_conf.output_bpp = NN_BPP;
   dcmipp_conf.mode = aspect_ratio;
-  dcmipp_conf.enable_swap = 0;
+  dcmipp_conf.enable_swap = 1; /* Enable Red/Blue swap so memory receives true RGB888 */
   dcmipp_conf.enable_gamma_conversion = GAMMA_CONVERSION;
   ret = CMW_CAMERA_SetPipeConfig(DCMIPP_PIPE2, &dcmipp_conf, pitch);
   if (ret != HAL_OK) {

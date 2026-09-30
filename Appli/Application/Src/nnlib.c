@@ -117,6 +117,7 @@ bool nnlib_set_input(nnlib_config_t *config, void *input_data, uint32_t size) {
 
   if (num_inputs > 0 && inputs[0] != NULL) {
     memcpy(inputs[0], input_data, size);
+    SCB_CleanDCache_by_Addr((volatile void *)inputs[0], size);
     return true;
   }
 
