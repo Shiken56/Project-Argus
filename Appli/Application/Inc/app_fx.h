@@ -12,7 +12,8 @@ typedef struct {
     T_MSG           hdr;            /* MUST be first field — TRON mailbox protocol */
     uint32_t        frame_id;       /* Which inference frame this came from */
     uint8_t         num_detected;   /* Number of boxes detected by OD */
-    DetectionBox_t  top_box;        /* The best (highest-confidence) detection box */
+    uint8_t         box_index;      /* Index of this detection (0 = top-1, 1 = 2nd, ...) */
+    DetectionBox_t  top_box;        /* The detection box this crop was made from */
 } FxJobMsg_t;
 
 /**

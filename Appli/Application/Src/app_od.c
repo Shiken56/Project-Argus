@@ -33,10 +33,15 @@ ID mbx_od_to_fx = -1;
 
 /* Shared crop buffer for ReID input (128 x 256 x 3 = 98304 bytes).
  * Placed in external 32MB PSRAM (.psram_bss) to save internal SRAM.
- * od_task writes the cropped person into this buffer, then sends a mailbox
- * message to fx_task which reads from it. Ordering is guaranteed by mailbox. */
+ * od_task writes the cropped person into this buffer, sets fx_busy = true,
+ * then sends a mailbox message to fx_task.
+ * Once fx_task completes nnlib_set_input(), fx_busy is cleared so od_task
+ * can reuse this buffer for the next crop. */
 __attribute__((section(".psram_bss"))) __attribute__((aligned(32)))
-uint8_t reid_input_buf[128 * 256 * 3];  /* 98304 bytes = STAI_FX_MODEL_IN_1_SIZE_BYTES */
+uint8_t reid_input_buf[128 * 256 * 3];
+
+extern volatile bool fx_busy;
+static uint8_t s_reid_rr_idx = 0;  /* Round-robin index cycling across detected persons */
 
 /* Static AI context for OD model */
 STAI_NETWORK_CONTEXT_DECLARE(od_network, STAI_OD_MODEL_CONTEXT_SIZE);
@@ -44,9 +49,7 @@ STAI_NETWORK_CONTEXT_DECLARE(od_network, STAI_OD_MODEL_CONTEXT_SIZE);
 volatile bool npu_is_inferencing = false;
 volatile uint32_t npu_inf_start_tick = 0;
 
-/* Static mailbox message — valid until fx_task reads it.
- * Using a single static instance is safe because od_task only sends
- * a new message after the previous one has been picked up (mailbox depth=1). */
+/* Static mailbox message for passing crop job to fx_task */
 static FxJobMsg_t s_fx_msg;
 
 /* OD model configuration with vtable */
@@ -220,18 +223,23 @@ LOCAL void od_task(INT stacd, void *exinf) {
     bool inf_ret = nnlib_run_inference(&od_nn_config, &inf_ms);
     npu_is_inferencing = false;
 
-    tk_sig_sem(sem_npu, 1);   /* Release NPU immediately after YOLO */
-
     if (!inf_ret) {
         PRINT("[OD ERROR] Inference Failed or Hanged!\r\n");
+        tk_sig_sem(sem_npu, 1);
         continue;
     }
 
+    /* --- Get model output BEFORE releasing NPU mutex --- */
+    float *bboxes = NULL;
+    bool get_out_ok = nnlib_get_output(&od_nn_config, (void**)&bboxes);
+
+    /* Release NPU mutex immediately after retrieving outputs so fx_task can run */
+    tk_sig_sem(sem_npu, 1);
+
     inf_count++;
 
-    /* --- Get, Filter with NMS and Stream results --- */
-    float *bboxes = NULL;
-    if (nnlib_get_output(&od_nn_config, (void**)&bboxes) && bboxes != NULL) {
+    /* --- Filter with NMS and Stream results --- */
+    if (get_out_ok && bboxes != NULL) {
         #define MAX_CANDIDATES 32
         DetectionBox_t candidates[MAX_CANDIDATES];
         bool suppressed[MAX_CANDIDATES] = {false};
@@ -257,27 +265,12 @@ LOCAL void od_task(INT stacd, void *exinf) {
             }
         }
 
-        /* Sort candidates by confidence descending */
-        for (uint8_t i = 0; i < num_candidates; i++) {
-            for (uint8_t j = i + 1; j < num_candidates; j++) {
-                if (candidates[j].conf > candidates[i].conf) {
-                    DetectionBox_t tmp = candidates[i];
-                    candidates[i] = candidates[j];
-                    candidates[j] = tmp;
-                }
-            }
-        }
-
-        /* Non-Maximum Suppression (IoU > 0.45 threshold) */
+        /* Non-Maximum Suppression (IoU > 0.45 threshold, maintain stable spatial order) */
         DetectionBox_t detected_boxes[OD_MAX_STREAM_BOXES];
         uint8_t num_detected = 0;
 
         for (uint8_t i = 0; i < num_candidates; i++) {
             if (suppressed[i]) continue;
-
-            if (num_detected < OD_MAX_STREAM_BOXES) {
-                detected_boxes[num_detected++] = candidates[i];
-            }
 
             for (uint8_t j = i + 1; j < num_candidates; j++) {
                 if (suppressed[j]) continue;
@@ -286,8 +279,17 @@ LOCAL void od_task(INT stacd, void *exinf) {
                     candidates[j].cx, candidates[j].cy, candidates[j].w, candidates[j].h
                 );
                 if (iou > 0.45f) {
-                    suppressed[j] = true;
+                    if (candidates[j].conf > candidates[i].conf) {
+                        suppressed[i] = true;
+                        break;
+                    } else {
+                        suppressed[j] = true;
+                    }
                 }
+            }
+
+            if (!suppressed[i] && num_detected < OD_MAX_STREAM_BOXES) {
+                detected_boxes[num_detected++] = candidates[i];
             }
         }
 
@@ -303,22 +305,44 @@ LOCAL void od_task(INT stacd, void *exinf) {
                       (unsigned long)inf_ms);
             }
 
-            /* --- Crop top-1 detection into shared reid_input_buf --- */
-            image_crop_resize_nn(
-                ml_buffer, ML_WIDTH, ML_HEIGHT,
-                detected_boxes[0].cx, detected_boxes[0].cy,
-                detected_boxes[0].w,  detected_boxes[0].h,
-                reid_input_buf, 128, 256
-            );
+            /* --- Single-buffer round-robin ReID: process one person per frame if FX is free --- */
+            if (!fx_busy) {
+                uint8_t target_idx = s_reid_rr_idx % num_detected;
 
-            /* Send job to fx_task via mailbox (non-blocking for od_task) */
-            memset(&s_fx_msg.hdr, 0, sizeof(T_MSG));
-            s_fx_msg.frame_id     = inf_count;
-            s_fx_msg.num_detected = num_detected;
-            s_fx_msg.top_box      = detected_boxes[0];
+                image_crop_resize_bilinear(
+                    ml_buffer, ML_WIDTH, ML_HEIGHT,
+                    detected_boxes[target_idx].cx, detected_boxes[target_idx].cy,
+                    detected_boxes[target_idx].w,  detected_boxes[target_idx].h,
+                    reid_input_buf, 128, 256
+                );
+                /* Flush CPU D-Cache to ensure NPU DMA reads newly written crop pixels */
+                SCB_CleanDCache_by_Addr((volatile void *)reid_input_buf, sizeof(reid_input_buf));
 
-            /* Try to send — if mailbox is full (fx_task busy), skip this frame's ReID */
-            tk_snd_mbx(mbx_od_to_fx, (T_MSG*)&s_fx_msg);
+                PRINT("[OD->FX] Crop box=%u/%u [cx=%d cy=%d w=%d h=%d] | frame=%lu | px=[%u,%u,%u,%u]\r\n",
+                      (unsigned int)target_idx,
+                      (unsigned int)num_detected,
+                      (int)(detected_boxes[target_idx].cx * 1000.0f),
+                      (int)(detected_boxes[target_idx].cy * 1000.0f),
+                      (int)(detected_boxes[target_idx].w * 1000.0f),
+                      (int)(detected_boxes[target_idx].h * 1000.0f),
+                      (unsigned long)inf_count,
+                      reid_input_buf[0], reid_input_buf[1], reid_input_buf[2], reid_input_buf[3]);
+
+                memset(&s_fx_msg.hdr, 0, sizeof(T_MSG));
+                s_fx_msg.frame_id     = inf_count;
+                s_fx_msg.num_detected = num_detected;
+                s_fx_msg.box_index    = target_idx;
+                s_fx_msg.top_box      = detected_boxes[target_idx];
+
+                fx_busy = true;  /* Mark busy until fx_task sets input on NPU */
+                tk_snd_mbx(mbx_od_to_fx, (T_MSG*)&s_fx_msg);
+
+                s_reid_rr_idx++; /* Advance round-robin for next cycle */
+            } else {
+                if (inf_count % 10 == 0) {
+                    PRINT("[OD->FX] FX busy, skipping crop for frame %lu\r\n", (unsigned long)inf_count);
+                }
+            }
 
         } else if (inf_count % 10 == 0) {
             PRINT("--- [NO DETECTION] Max Conf: %d%% (Threshold: 30%%) | Infer: %lu ms\r\n",

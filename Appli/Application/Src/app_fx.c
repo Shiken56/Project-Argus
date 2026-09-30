@@ -13,9 +13,12 @@
 /* =========================================================================
  * External resources shared with od_task (created in app_od.c)
  * ========================================================================= */
-extern ID sem_npu;                  /* NPU mutex semaphore (count=1) */
-extern ID mbx_od_to_fx;            /* Mailbox: OD -> FX job queue */
-extern uint8_t reid_input_buf[];   /* Shared crop buffer, filled by od_task */
+extern ID sem_npu;                       /* NPU mutex semaphore (count=1) */
+extern ID mbx_od_to_fx;                 /* Mailbox: OD -> FX job queue */
+extern uint8_t reid_input_buf[128 * 256 * 3]; /* Single shared crop buffer */
+
+/* Flag to protect reid_input_buf: true while waiting for/processing set_input, false once buffer is free */
+volatile bool fx_busy = false;
 
 /* =========================================================================
  * FX (ReID) Model Configuration
@@ -67,32 +70,49 @@ LOCAL void fx_task(INT stacd, void *exinf) {
         if (!nnlib_set_input(&fx_nn_config, reid_input_buf,
                              STAI_FX_MODEL_IN_1_SIZE_BYTES)) {
             PRINT("[FX ERROR] Failed to set FX input buffer\r\n");
+            fx_busy = false;
             tk_sig_sem(sem_npu, 1);
             continue;
         }
 
+        /* reid_input_buf is now DMA-loaded / consumed by NPU; safe for od_task to reuse */
+        fx_busy = false;
+
         uint32_t inf_ms_reid = 0;
         bool inf_ok = nnlib_run_inference(&fx_nn_config, &inf_ms_reid);
 
-        tk_sig_sem(sem_npu, 1);   /* Release NPU */
-
         if (!inf_ok) {
             PRINT("[FX ERROR] OSNet Inference Failed!\r\n");
+            tk_sig_sem(sem_npu, 1);
             continue;
         }
 
-        /* --- Get embedding output --- */
+        /* --- Get embedding output BEFORE releasing NPU mutex --- */
         int8_t *emb_ptr = NULL;
         if (nnlib_get_output(&fx_nn_config, (void**)&emb_ptr) && emb_ptr != NULL) {
-            /* Send ReID embedding to Ethernet streamer */
-            Ethernet_Streamer_UpdateReID(msg->frame_id, emb_ptr,
+            /* Invalidate CPU D-Cache to ensure CPU reads fresh embedding bytes written by NPU */
+            SCB_InvalidateDCache_by_Addr((volatile void *)emb_ptr, STAI_FX_MODEL_OUT_1_SIZE_BYTES);
+
+            /* Convert model signed INT8 (zero-point -128) to clean unsigned UINT8 [0..255] */
+            uint8_t u8_emb[STAI_FX_MODEL_OUT_1_SIZE_BYTES];
+            for (uint16_t k = 0; k < STAI_FX_MODEL_OUT_1_SIZE_BYTES; k++) {
+                u8_emb[k] = (uint8_t)((int)emb_ptr[k] + 128);
+            }
+
+            /* Send ReID embedding to Ethernet streamer, tagged with box coordinates and index */
+            Ethernet_Streamer_UpdateReID(msg->frame_id, msg->box_index, &msg->top_box, (const int8_t*)u8_emb,
                                          STAI_FX_MODEL_OUT_1_SIZE_BYTES);
 
-            PRINT("[FX] ReID done | frame=%lu | reid_ms=%lu | emb_size=%u\r\n",
+            PRINT("[FX] ReID done | frame=%lu | box=%u | ms=%lu\r\n[FX EMB 128]: [",
                   (unsigned long)msg->frame_id,
-                  (unsigned long)inf_ms_reid,
-                  (unsigned int)STAI_FX_MODEL_OUT_1_SIZE_BYTES);
+                  (unsigned int)msg->box_index,
+                  (unsigned long)inf_ms_reid);
+            for (uint16_t k = 0; k < STAI_FX_MODEL_OUT_1_SIZE_BYTES; k++) {
+                PRINT("%u%s", (unsigned int)u8_emb[k], (k + 1 < STAI_FX_MODEL_OUT_1_SIZE_BYTES) ? ", " : "]\r\n");
+            }
         }
+
+        tk_sig_sem(sem_npu, 1);   /* Release NPU AFTER outputs are retrieved */
 
         tk_rot_rdq(0);  /* Yield to other same-priority tasks */
     }

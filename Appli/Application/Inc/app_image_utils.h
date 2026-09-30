@@ -28,4 +28,16 @@ void image_crop_resize_nn(
     uint8_t *dst, int dst_w, int dst_h
 );
 
+/**
+ * @brief Bilinear interpolation crop+resize from a source RGB888 image to a
+ *        destination RGB888 image.
+ *
+ * Provides smooth, anti-aliased scaling for ReID feature extraction.
+ */
+void image_crop_resize_bilinear(
+    const uint8_t *src, int src_w, int src_h,
+    float cx_norm, float cy_norm, float w_norm, float h_norm,
+    uint8_t *dst, int dst_w, int dst_h
+);
+
 #endif /* APP_IMAGE_UTILS_H */
