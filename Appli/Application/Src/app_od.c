@@ -305,8 +305,9 @@ LOCAL void od_task(INT stacd, void *exinf) {
                       (unsigned long)inf_ms);
             }
 
-            /* --- Single-buffer round-robin ReID: process one person per frame if FX is free --- */
-            if (!fx_busy) {
+            /* --- Decoupled ReID: process one person crop every 6 frames to keep NPU free for high-FPS YOLO --- */
+            static uint32_t s_reid_throttle = 0;
+            if (!fx_busy && (++s_reid_throttle % 6 == 0)) {
                 uint8_t target_idx = s_reid_rr_idx % num_detected;
 
                 image_crop_resize_bilinear(
@@ -318,15 +319,17 @@ LOCAL void od_task(INT stacd, void *exinf) {
                 /* Flush CPU D-Cache to ensure NPU DMA reads newly written crop pixels */
                 SCB_CleanDCache_by_Addr((volatile void *)reid_input_buf, sizeof(reid_input_buf));
 
-                PRINT("[OD->FX] Crop box=%u/%u [cx=%d cy=%d w=%d h=%d] | frame=%lu | px=[%u,%u,%u,%u]\r\n",
-                      (unsigned int)target_idx,
-                      (unsigned int)num_detected,
-                      (int)(detected_boxes[target_idx].cx * 1000.0f),
-                      (int)(detected_boxes[target_idx].cy * 1000.0f),
-                      (int)(detected_boxes[target_idx].w * 1000.0f),
-                      (int)(detected_boxes[target_idx].h * 1000.0f),
-                      (unsigned long)inf_count,
-                      reid_input_buf[0], reid_input_buf[1], reid_input_buf[2], reid_input_buf[3]);
+                static uint32_t s_crop_log_div = 0;
+                if (++s_crop_log_div % 15 == 0) {
+                    PRINT("[OD->FX] Crop box=%u/%u [cx=%d cy=%d w=%d h=%d] | frame=%lu\r\n",
+                          (unsigned int)target_idx,
+                          (unsigned int)num_detected,
+                          (int)(detected_boxes[target_idx].cx * 1000.0f),
+                          (int)(detected_boxes[target_idx].cy * 1000.0f),
+                          (int)(detected_boxes[target_idx].w * 1000.0f),
+                          (int)(detected_boxes[target_idx].h * 1000.0f),
+                          (unsigned long)inf_count);
+                }
 
                 memset(&s_fx_msg.hdr, 0, sizeof(T_MSG));
                 s_fx_msg.frame_id     = inf_count;
@@ -338,10 +341,6 @@ LOCAL void od_task(INT stacd, void *exinf) {
                 tk_snd_mbx(mbx_od_to_fx, (T_MSG*)&s_fx_msg);
 
                 s_reid_rr_idx++; /* Advance round-robin for next cycle */
-            } else {
-                if (inf_count % 10 == 0) {
-                    PRINT("[OD->FX] FX busy, skipping crop for frame %lu\r\n", (unsigned long)inf_count);
-                }
             }
 
         } else if (inf_count % 10 == 0) {

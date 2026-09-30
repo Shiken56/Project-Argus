@@ -25,8 +25,8 @@ static struct udp_pcb *stream_pcb = NULL;
 static ip_addr_t target_ip;
 static ID sem_stream_ready = 0;
 
-/* Double Buffers in PSRAM for 256x256 RGB565 streaming (avoids internal SRAM collision with 0x34100000) */
-static __attribute__((aligned(32))) __attribute__((section(".psram_bss"))) uint16_t s_rgb565_stream_buf[2][256 * 256];
+/* Double Buffers in PSRAM for 256x256 RGB888 streaming (avoids internal SRAM collision with 0x34100000) */
+static __attribute__((aligned(32))) __attribute__((section(".psram_bss"))) uint8_t s_rgb888_stream_buf[2][256 * 256 * 3];
 static volatile uint8_t s_active_read_buf = 0;
 static volatile bool s_stream_busy = false;
 static uint32_t s_frame_bytes[2] = {0, 0};
@@ -39,15 +39,6 @@ static OdMetadataPacket_t s_meta_pkt;
 #define REID_SLOTS 2
 static ReidMetadataPacket_t s_reid_pkt[REID_SLOTS];
 static volatile bool s_reid_pending[REID_SLOTS];
-
-static inline void convert_rgb888_to_rgb565(const uint8_t *src, uint16_t *dst, uint32_t num_pixels) {
-    for (uint32_t i = 0; i < num_pixels; i++) {
-        uint8_t r = src[i * 3 + 0];
-        uint8_t g = src[i * 3 + 1];
-        uint8_t b = src[i * 3 + 2];
-        dst[i] = (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3));
-    }
-}
 
 /* Dedicated Background RTOS Ethernet Streaming Task (Priority 11) */
 static void ethernet_stream_task(INT stacd, void *exinf) {
@@ -67,7 +58,7 @@ static void ethernet_stream_task(INT stacd, void *exinf) {
         }
 
         uint8_t r_idx = s_active_read_buf;
-        const uint8_t *frame_data = (const uint8_t *)s_rgb565_stream_buf[r_idx];
+        const uint8_t *frame_data = (const uint8_t *)s_rgb888_stream_buf[r_idx];
         uint32_t total_bytes = s_frame_bytes[r_idx];
         uint32_t frame_id = s_stream_frame_id[r_idx];
 
@@ -97,10 +88,13 @@ static void ethernet_stream_task(INT stacd, void *exinf) {
                 udp_sendto(stream_pcb, p_reid, &target_ip, TARGET_PORT);
                 pbuf_free(p_reid);
 
-                PRINT("[ETH UDP] Sent ReID pkt: box=%u | frame=%lu | bytes=%u\r\n",
-                      (unsigned int)s_reid_pkt[ri].box_index,
-                      (unsigned long)s_reid_pkt[ri].frame_id,
-                      (unsigned int)pkt_size);
+                static uint32_t s_eth_reid_log_div = 0;
+                if (++s_eth_reid_log_div % 15 == 0) {
+                    PRINT("[ETH UDP] Sent ReID pkt: box=%u | frame=%lu | bytes=%u\r\n",
+                          (unsigned int)s_reid_pkt[ri].box_index,
+                          (unsigned long)s_reid_pkt[ri].frame_id,
+                          (unsigned int)pkt_size);
+                }
             }
             s_reid_pending[ri] = false;
         }
@@ -170,8 +164,8 @@ void Ethernet_Streamer_Init(void) {
         T_CSEM csem = {.exinf = NULL, .sematr = TA_TFIFO, .isemcnt = 0, .maxsem = 1};
         sem_stream_ready = tk_cre_sem(&csem);
 
-/* Decimation factor: 2 = send 15 FPS (smooth display, balanced for NPU bus), 1 = 30 FPS */
-#define STREAM_DECIMATION 2
+/* Decimation factor: 1 = send full 30 FPS */
+#define STREAM_DECIMATION 1
 
         /* Create Dedicated Background Task (Priority 11 - co-operates with OD task) */
         T_CTSK ctsk = {
@@ -202,7 +196,7 @@ void Ethernet_Streamer_SendVideoFrame(
 ) {
     if (sem_stream_ready <= 0) return;
 
-    /* Rate decimation: Send at 15 FPS to leave bus bandwidth for NPU */
+    /* Rate decimation: Send at full speed */
     static uint32_t s_stream_div = 0;
     if (++s_stream_div % STREAM_DECIMATION != 0) {
         return;
@@ -214,15 +208,11 @@ void Ethernet_Streamer_SendVideoFrame(
     }
 
     uint8_t write_idx = s_active_read_buf ^ 1;
+    uint32_t frame_len = width * height * bpp;
 
-    if (bpp == 3) {
-        /* Ultra-fast RGB888 -> RGB565 conversion directly into internal cached SRAM */
-        convert_rgb888_to_rgb565(frame_buffer, s_rgb565_stream_buf[write_idx], width * height);
-        s_frame_bytes[write_idx] = width * height * 2;
-    } else {
-        memcpy(s_rgb565_stream_buf[write_idx], frame_buffer, width * height * bpp);
-        s_frame_bytes[write_idx] = width * height * bpp;
-    }
+    /* Direct memory copy without CPU pixel arithmetic */
+    memcpy(s_rgb888_stream_buf[write_idx], frame_buffer, frame_len);
+    s_frame_bytes[write_idx] = frame_len;
 
     s_stream_frame_id[write_idx] = frame_id;
     s_active_read_buf = write_idx;

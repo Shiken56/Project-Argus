@@ -103,12 +103,12 @@ LOCAL void fx_task(INT stacd, void *exinf) {
             Ethernet_Streamer_UpdateReID(msg->frame_id, msg->box_index, &msg->top_box, (const int8_t*)u8_emb,
                                          STAI_FX_MODEL_OUT_1_SIZE_BYTES);
 
-            PRINT("[FX] ReID done | frame=%lu | box=%u | ms=%lu\r\n[FX EMB 128]: [",
-                  (unsigned long)msg->frame_id,
-                  (unsigned int)msg->box_index,
-                  (unsigned long)inf_ms_reid);
-            for (uint16_t k = 0; k < STAI_FX_MODEL_OUT_1_SIZE_BYTES; k++) {
-                PRINT("%u%s", (unsigned int)u8_emb[k], (k + 1 < STAI_FX_MODEL_OUT_1_SIZE_BYTES) ? ", " : "]\r\n");
+            static uint32_t s_fx_log_div = 0;
+            if (++s_fx_log_div % 15 == 0) {
+                PRINT("[FX] ReID done | frame=%lu | box=%u | ms=%lu\r\n",
+                      (unsigned long)msg->frame_id,
+                      (unsigned int)msg->box_index,
+                      (unsigned long)inf_ms_reid);
             }
         }
 

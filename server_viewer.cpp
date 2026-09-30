@@ -760,7 +760,7 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
     std::cout << "    Use Mouse Wheel or Up/Down arrows to adjust in real-time!\n";
 
     std::vector<uint8_t> recv_buf(2048);
-    std::vector<uint8_t> raw_frame_565(FRAME_W * FRAME_H * 2, 0);
+    std::vector<uint8_t> raw_frame_rgb(FRAME_W * FRAME_H * 3, 0);
 
     OdMetadataPacket_t current_meta = {};
     uint32_t active_frame_id = 0;
@@ -984,11 +984,11 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
 
             int payload_len = hdr.payload_len;
             if (sizeof(VideoChunkHeader_t) + payload_len <= (size_t)bytes) {
-                int stride = (hdr.total_chunks <= 100) ? 1400 : 1024;
+                int stride = (hdr.total_chunks <= 150) ? 1400 : 1024;
                 int offset = hdr.chunk_idx * stride;
 
-                if (offset + payload_len <= (int)raw_frame_565.size()) {
-                    memcpy(raw_frame_565.data() + offset,
+                if (offset + payload_len <= (int)raw_frame_rgb.size()) {
+                    memcpy(raw_frame_rgb.data() + offset,
                            recv_buf.data() + sizeof(VideoChunkHeader_t),
                            payload_len);
                 }
@@ -1002,15 +1002,11 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
                 // Frame complete or last chunk received
                 if (chunks_received >= hdr.total_chunks || hdr.chunk_idx == hdr.total_chunks - 1) {
                     EnterCriticalSection(&g_cs);
-                    const uint16_t* p565 = (const uint16_t*)raw_frame_565.data();
+                    const uint8_t* pRgb = raw_frame_rgb.data();
                     for (int i = 0; i < FRAME_W * FRAME_H; i++) {
-                        uint16_t c = p565[i];
-                        uint8_t cr = (c >> 11) & 0x1F;
-                        uint8_t cg = (c >> 5) & 0x3F;
-                        uint8_t cb = c & 0x1F;
-                        uint8_t r = (cr * 527 + 23) >> 6;
-                        uint8_t g = (cg * 259 + 33) >> 6;
-                        uint8_t b = (cb * 527 + 23) >> 6;
+                        uint8_t r = pRgb[i * 3 + 0];
+                        uint8_t g = pRgb[i * 3 + 1];
+                        uint8_t b = pRgb[i * 3 + 2];
                         g_rgb32_buffer[i] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
                     }
                     g_latest_meta = current_meta;
