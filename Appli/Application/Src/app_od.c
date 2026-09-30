@@ -309,38 +309,47 @@ LOCAL void od_task(INT stacd, void *exinf) {
             static uint32_t s_reid_throttle = 0;
             if (!fx_busy && (++s_reid_throttle % 6 == 0)) {
                 uint8_t target_idx = s_reid_rr_idx % num_detected;
+                float bcx = detected_boxes[target_idx].cx;
+                float bcy = detected_boxes[target_idx].cy;
 
-                image_crop_resize_bilinear(
-                    ml_buffer, ML_WIDTH, ML_HEIGHT,
-                    detected_boxes[target_idx].cx, detected_boxes[target_idx].cy,
-                    detected_boxes[target_idx].w,  detected_boxes[target_idx].h,
-                    reid_input_buf, 128, 256
-                );
-                /* Flush CPU D-Cache to ensure NPU DMA reads newly written crop pixels */
-                SCB_CleanDCache_by_Addr((volatile void *)reid_input_buf, sizeof(reid_input_buf));
+                /* Check if center of bounding box is at least 30 pixels away from all image edges (~11.7%) */
+                #define REID_EDGE_MARGIN_NORM (30.0f / 256.0f) /* ~0.1171875 */
+                bool center_inside_bounds = (bcx >= REID_EDGE_MARGIN_NORM && bcx <= (1.0f - REID_EDGE_MARGIN_NORM) &&
+                                             bcy >= REID_EDGE_MARGIN_NORM && bcy <= (1.0f - REID_EDGE_MARGIN_NORM));
 
-                static uint32_t s_crop_log_div = 0;
-                if (++s_crop_log_div % 15 == 0) {
-                    PRINT("[OD->FX] Crop box=%u/%u [cx=%d cy=%d w=%d h=%d] | frame=%lu\r\n",
-                          (unsigned int)target_idx,
-                          (unsigned int)num_detected,
-                          (int)(detected_boxes[target_idx].cx * 1000.0f),
-                          (int)(detected_boxes[target_idx].cy * 1000.0f),
-                          (int)(detected_boxes[target_idx].w * 1000.0f),
-                          (int)(detected_boxes[target_idx].h * 1000.0f),
-                          (unsigned long)inf_count);
+                if (center_inside_bounds) {
+                    image_crop_resize_bilinear(
+                        ml_buffer, ML_WIDTH, ML_HEIGHT,
+                        detected_boxes[target_idx].cx, detected_boxes[target_idx].cy,
+                        detected_boxes[target_idx].w,  detected_boxes[target_idx].h,
+                        reid_input_buf, 128, 256
+                    );
+                    /* Flush CPU D-Cache to ensure NPU DMA reads newly written crop pixels */
+                    SCB_CleanDCache_by_Addr((volatile void *)reid_input_buf, sizeof(reid_input_buf));
+
+                    static uint32_t s_crop_log_div = 0;
+                    if (++s_crop_log_div % 15 == 0) {
+                        PRINT("[OD->FX] Crop box=%u/%u [cx=%d cy=%d w=%d h=%d] | frame=%lu\r\n",
+                              (unsigned int)target_idx,
+                              (unsigned int)num_detected,
+                              (int)(detected_boxes[target_idx].cx * 1000.0f),
+                              (int)(detected_boxes[target_idx].cy * 1000.0f),
+                              (int)(detected_boxes[target_idx].w * 1000.0f),
+                              (int)(detected_boxes[target_idx].h * 1000.0f),
+                              (unsigned long)inf_count);
+                    }
+
+                    memset(&s_fx_msg.hdr, 0, sizeof(T_MSG));
+                    s_fx_msg.frame_id     = inf_count;
+                    s_fx_msg.num_detected = num_detected;
+                    s_fx_msg.box_index    = target_idx;
+                    s_fx_msg.top_box      = detected_boxes[target_idx];
+
+                    fx_busy = true;  /* Mark busy until fx_task sets input on NPU */
+                    tk_snd_mbx(mbx_od_to_fx, (T_MSG*)&s_fx_msg);
+
+                    s_reid_rr_idx++; /* Advance round-robin for next cycle */
                 }
-
-                memset(&s_fx_msg.hdr, 0, sizeof(T_MSG));
-                s_fx_msg.frame_id     = inf_count;
-                s_fx_msg.num_detected = num_detected;
-                s_fx_msg.box_index    = target_idx;
-                s_fx_msg.top_box      = detected_boxes[target_idx];
-
-                fx_busy = true;  /* Mark busy until fx_task sets input on NPU */
-                tk_snd_mbx(mbx_od_to_fx, (T_MSG*)&s_fx_msg);
-
-                s_reid_rr_idx++; /* Advance round-robin for next cycle */
             }
 
         } else if (inf_count % 10 == 0) {

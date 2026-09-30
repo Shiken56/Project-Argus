@@ -653,15 +653,25 @@ static uint32_t tx_idx = 0;
 /* ========================================================================= */
 static err_t low_level_output(struct netif *netif, struct pbuf *p) {
   (void)netif;
-  static uint32_t s_tx_log_cnt = 0;
 
   if (p == NULL || p->tot_len > 1514) {
     return ERR_BUF;
   }
 
-  /* Copy pbuf chain into contiguous DMA TX buffer */
   sys_mutex_lock(&tx_mutex);
 
+  /* Check if current descriptor is currently owned by DMA */
+  ETH_DMADescTypeDef *desc = (ETH_DMADescTypeDef *)heth1.TxDescList[0].TxDesc[tx_idx];
+  uint32_t wait_count = 0;
+  while ((desc->DESC3 & ETH_DMATXNDESCWBF_OWN) != 0) {
+    if (++wait_count > 2000) {
+      /* Timeout: drop packet rather than freezing CPU */
+      sys_mutex_unlock(&tx_mutex);
+      return ERR_IF;
+    }
+  }
+
+  /* Copy pbuf payload directly into contiguous DMA TX buffer */
   pbuf_copy_partial(p, TxBuffers[tx_idx], p->tot_len, 0);
 
   Txbuffer[tx_idx].buffer = TxBuffers[tx_idx];
@@ -674,7 +684,8 @@ static err_t low_level_output(struct netif *netif, struct pbuf *p) {
   TxConfig.Attributes = ETH_TX_PACKETS_FEATURES_CRCPAD;
   TxConfig.CRCPadCtrl = ETH_CRC_PAD_INSERT;
 
-  HAL_StatusTypeDef status = HAL_ETH_Transmit(&heth1, &TxConfig, 100);
+  /* Use non-blocking transmit (returns immediately after submitting descriptor to DMA) */
+  HAL_StatusTypeDef status = HAL_ETH_Transmit_IT(&heth1, &TxConfig);
 
   if (status != HAL_OK) {
     sys_mutex_unlock(&tx_mutex);

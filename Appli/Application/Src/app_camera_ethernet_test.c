@@ -99,7 +99,8 @@ static void ethernet_stream_task(INT stacd, void *exinf) {
             s_reid_pending[ri] = false;
         }
 
-        /* 2. Transmit Video Chunks */
+        /* 2. Transmit Video Chunks using static packet buffer (zero dynamic heap allocation) */
+        static uint8_t s_chunk_packet_buf[sizeof(VideoChunkHeader_t) + UDP_CHUNK_PAYLOAD_SIZE];
         uint16_t total_chunks = (total_bytes + UDP_CHUNK_PAYLOAD_SIZE - 1) / UDP_CHUNK_PAYLOAD_SIZE;
 
         for (uint16_t c = 0; c < total_chunks; c++) {
@@ -110,26 +111,31 @@ static void ethernet_stream_task(INT stacd, void *exinf) {
             }
 
             uint16_t packet_size = sizeof(VideoChunkHeader_t) + chunk_len;
-            struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, packet_size, PBUF_RAM);
-            if (p != NULL) {
-                VideoChunkHeader_t *hdr = (VideoChunkHeader_t *)p->payload;
-                hdr->magic = STREAM_MAGIC;
-                hdr->pkt_type = PKT_TYPE_VIDEO_CHUNK;
-                hdr->reserved = 0;
-                hdr->chunk_idx = c;
-                hdr->total_chunks = total_chunks;
-                hdr->payload_len = chunk_len;
-                hdr->frame_id = frame_id;
+            VideoChunkHeader_t *hdr = (VideoChunkHeader_t *)s_chunk_packet_buf;
+            hdr->magic = STREAM_MAGIC;
+            hdr->pkt_type = PKT_TYPE_VIDEO_CHUNK;
+            hdr->reserved = 0;
+            hdr->chunk_idx = c;
+            hdr->total_chunks = total_chunks;
+            hdr->payload_len = chunk_len;
+            hdr->frame_id = frame_id;
 
-                memcpy((uint8_t *)p->payload + sizeof(VideoChunkHeader_t), frame_data + offset, chunk_len);
+            memcpy(s_chunk_packet_buf + sizeof(VideoChunkHeader_t), frame_data + offset, chunk_len);
 
-                udp_sendto(stream_pcb, p, &target_ip, TARGET_PORT);
-                pbuf_free(p);
+            struct pbuf p_chunk;
+            p_chunk.next = NULL;
+            p_chunk.payload = s_chunk_packet_buf;
+            p_chunk.tot_len = packet_size;
+            p_chunk.len = packet_size;
+            p_chunk.type_internal = PBUF_ROM;
+            p_chunk.flags = 0;
+            p_chunk.ref = 1;
 
-                /* Cooperative yield every 16 chunks so OD task is never locked out */
-                if ((c & 15) == 0) {
-                    tk_rot_rdq(0);
-                }
+            udp_sendto(stream_pcb, &p_chunk, &target_ip, TARGET_PORT);
+
+            /* Cooperative yield every 16 chunks so OD task is never locked out */
+            if ((c & 15) == 0) {
+                tk_rot_rdq(0);
             }
         }
 
