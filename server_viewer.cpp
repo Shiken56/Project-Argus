@@ -16,6 +16,7 @@
 #include <iomanip>
 #include <sstream>
 #include <atomic>
+#include <unordered_map>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "gdi32.lib")
@@ -128,6 +129,21 @@ struct ActiveTrack {
 };
 static std::vector<ActiveTrack> g_tracks;
 static int g_next_track_id = 1;
+
+// Dynamic Camera / Board IP Mapping
+static std::string g_active_board_ip = "Connecting...";
+static int g_active_camera_id = 1;
+static std::unordered_map<std::string, int> g_board_cam_map;
+static int g_next_cam_id = 1;
+
+static int register_or_get_camera_id(const std::string& ip) {
+    if (g_board_cam_map.find(ip) == g_board_cam_map.end()) {
+        int assigned = g_next_cam_id++;
+        g_board_cam_map[ip] = assigned;
+        std::cout << "\n[CAMERA REGISTRATION] Board IP " << ip << " registered as Camera #" << assigned << "\n\n";
+    }
+    return g_board_cam_map[ip];
+}
 
 // Thread Synchronization & Shared Data
 static CRITICAL_SECTION g_cs;
@@ -264,8 +280,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             char bannerText[256];
             snprintf(bannerText, sizeof(bannerText),
-                     "  STM32N6 EDGE-AI | Frame #%u | Video: %.1f FPS | YOLO: %u ms | Tracks: %u | Thresh: %.0f%% (Scroll to tune)",
-                     frame_id, fps, (unsigned int)meta.inference_ms, (unsigned int)tracks_copy.size(), g_reid_similarity_threshold.load() * 100.0f);
+                     "  CAM #%d [%s] | Frame #%u | Video: %.1f FPS | YOLO: %u ms | Tracks: %u | Thresh: %.0f%%",
+                     g_active_camera_id, g_active_board_ip.c_str(), frame_id, fps,
+                     (unsigned int)meta.inference_ms, (unsigned int)tracks_copy.size(),
+                     g_reid_similarity_threshold.load() * 100.0f);
 
             SetTextColor(memDC, RGB(0, 240, 255));
             SetBkMode(memDC, TRANSPARENT);
@@ -778,6 +796,12 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
         uint32_t magic;
         memcpy(&magic, recv_buf.data(), sizeof(uint32_t));
         if (magic != STREAM_MAGIC) continue;
+
+        // Extract client IP and map to Camera ID
+        std::string client_ip_str = inet_ntoa(client_addr.sin_addr);
+        int cam_id = register_or_get_camera_id(client_ip_str);
+        g_active_board_ip = client_ip_str;
+        g_active_camera_id = cam_id;
 
         uint8_t pkt_type = recv_buf[4];
 

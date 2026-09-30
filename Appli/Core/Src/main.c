@@ -433,18 +433,22 @@ static void MX_ETH1_Init(void)
 
   /* USER CODE END ETH1_Init 0 */
 
-   static uint8_t MACAddr[6];
+  static uint8_t MACAddr[6];
 
   /* USER CODE BEGIN ETH1_Init 1 */
 
   /* USER CODE END ETH1_Init 1 */
   heth1.Instance = ETH1;
+
+  /* Derive unique, persistent MAC address from STM32 factory 96-bit hardware UID */
+  uint32_t uid_hash = HAL_GetUIDw0() ^ HAL_GetUIDw1() ^ HAL_GetUIDw2();
   MACAddr[0] = 0x00;
   MACAddr[1] = 0x80;
-  MACAddr[2] = 0xE1;
-  MACAddr[3] = 0x00;
-  MACAddr[4] = 0x00;
-  MACAddr[5] = 0x00;
+  MACAddr[2] = 0xE1; /* STMicroelectronics vendor OUI */
+  MACAddr[3] = (uint8_t)(uid_hash >> 16);
+  MACAddr[4] = (uint8_t)(uid_hash >> 8);
+  MACAddr[5] = (uint8_t)(uid_hash & 0xFF);
+
   heth1.Init.MACAddr = &MACAddr[0];
   heth1.Init.MediaInterface = HAL_ETH_RGMII_MODE;
   for (int ch = 0; ch < ETH_DMA_CH_CNT; ch++)

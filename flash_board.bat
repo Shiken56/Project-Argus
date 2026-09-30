@@ -22,17 +22,17 @@ if %ERRORLEVEL% neq 0 (
 echo.
 echo ===================================================
 echo 2. Flashing FSBL and Appli to External Flash...
-echo    - FSBL  -> 0x70000000
-echo    - Appli -> 0x70100000
+echo    FSBL at 0x70000000
+echo    Appli at 0x70100000
 echo ===================================================
 
-%PROG_CLI% -c port=SWD ap=1 mode=UR -el %EXT_LOADER% -d "FSBL\Debug\mtk3bsp2_stm32n657_FSBL_signed.bin" 0x70000000 -v -d "Appli\Debug\mtk3bsp2_stm32n657_Appli_signed.bin" 0x70100000 -v -rst
+%PROG_CLI% -c port=SWD mode=HOTPLUG -el %EXT_LOADER% -d "FSBL\Debug\mtk3bsp2_stm32n657_FSBL-trusted.bin" 0x70000000 -v -d "Appli\Debug\mtk3bsp2_stm32n657_Appli-trusted.bin" 0x70100000 -v -rst
 
 if %ERRORLEVEL% equ 0 (
     echo.
     echo ===================================================
     echo Flashing and Verification SUCCESSFUL!
-    echo Ensure boot switch is set to Boot from External Flash (XSPI) and reset the board.
+    echo Ensure boot switch is set to Boot from External Flash and reset the board.
     echo ===================================================
 ) else (
     echo.

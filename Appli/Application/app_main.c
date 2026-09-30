@@ -38,6 +38,10 @@ LOCAL T_CTSK ctsk_cam = {
 
 
 
+/* Dynamic Hardware Identifiers derived from 96-bit UID */
+static uint8_t s_local_ip_last_octet = 10;
+static uint8_t s_local_mac[6] = {0x00, 0x80, 0xE1, 0x00, 0x00, 0x00};
+
 /* 3. Standard Ethernet Broadcast ARP Request */
 static void send_raw_arp_request(uint32_t seq)
 {
@@ -47,8 +51,7 @@ static void send_raw_arp_request(uint32_t seq)
 
     /* Ethernet Header (14 bytes) */
     memset(&frame[0], 0xFF, 6);                         /* Dst MAC: Broadcast */
-    frame[6] = 0x00; frame[7] = 0x80; frame[8] = 0xE1;
-    frame[9] = 0x00; frame[10] = 0x00; frame[11] = 0x00;/* Src MAC: 00:80:e1:00:00:00 */
+    memcpy(&frame[6], s_local_mac, 6);                 /* Src MAC: Dynamic UID MAC */
     frame[12] = 0x08; frame[13] = 0x06;                 /* EtherType: ARP */
 
     /* ARP Payload (28 bytes) */
@@ -58,12 +61,11 @@ static void send_raw_arp_request(uint32_t seq)
     frame[19] = 0x04;                                   /* Protocol Size: 4 */
     frame[20] = 0x00; frame[21] = 0x01;                 /* Opcode: Request (1) */
 
-    /* Sender MAC (00:80:e1:00:00:00) */
-    frame[22] = 0x00; frame[23] = 0x80; frame[24] = 0xE1;
-    frame[25] = 0x00; frame[26] = 0x00; frame[27] = 0x00;
+    /* Sender MAC */
+    memcpy(&frame[22], s_local_mac, 6);
     
-    /* Sender IP (192.168.1.10) */
-    frame[28] = 192; frame[29] = 168; frame[30] = 1; frame[31] = 10;
+    /* Sender IP (192.168.1.X dynamic) */
+    frame[28] = 192; frame[29] = 168; frame[30] = 1; frame[31] = s_local_ip_last_octet;
 
     /* Target MAC (00:00:00:00:00:00 - ignored in request) */
     memset(&frame[32], 0x00, 6);
@@ -81,8 +83,24 @@ LOCAL void net_task(INT stacd, void *exinf)
     ip4_addr_t gw;
     uint32_t tx_timer = 0;
     uint32_t pkt_seq = 0;
+
+    /* Compute unique MAC & IP from STM32 factory 96-bit UID */
+    uint32_t uid_hash = HAL_GetUIDw0() ^ HAL_GetUIDw1() ^ HAL_GetUIDw2();
+    s_local_mac[0] = 0x00;
+    s_local_mac[1] = 0x80;
+    s_local_mac[2] = 0xE1;
+    s_local_mac[3] = (uint8_t)(uid_hash >> 16);
+    s_local_mac[4] = (uint8_t)(uid_hash >> 8);
+    s_local_mac[5] = (uint8_t)(uid_hash & 0xFF);
+
+    /* Allocate dynamic last octet in range [20 .. 219], avoiding .1 (router) and .100 (laptop/PC) */
+    s_local_ip_last_octet = 20 + (uint8_t)(uid_hash % 200);
+    if (s_local_ip_last_octet == 100) {
+        s_local_ip_last_octet = 101;
+    }
+
     PRINT("\r\n========================================\r\n");
-    PRINT("  STM32N657 Ethernet TX & Ping Test    \r\n");
+    PRINT("  STM32N657 Ethernet TX & Multi-Board   \r\n");
     PRINT("========================================\r\n");
 
     /* 1. Start the TCP/IP thread */
@@ -90,8 +108,8 @@ LOCAL void net_task(INT stacd, void *exinf)
     tcpip_init(NULL, NULL);
     PRINT("[NET] TCP/IP thread running.\r\n");
 
-    /* 2. Configure Static IP Address: 192.168.1.10 */
-    IP4_ADDR(&ipaddr, 192, 168, 1, 10);
+    /* 2. Configure Dynamic IP Address: 192.168.1.X */
+    IP4_ADDR(&ipaddr, 192, 168, 1, s_local_ip_last_octet);
     IP4_ADDR(&netmask, 255, 255, 255, 0);
     IP4_ADDR(&gw, 192, 168, 1, 1);
 
@@ -104,9 +122,12 @@ LOCAL void net_task(INT stacd, void *exinf)
     netif_set_link_up(&gnetif);
 
     PRINT("[NET] Interface is UP!\r\n");
-    PRINT("[NET] Static IP  : 192.168.1.10\r\n");
-    PRINT("[NET] Netmask    : 255.255.255.0\r\n");
-    PRINT("[NET] Gateway    : 192.168.1.1\r\n");
+    PRINT("[NET] Hardware MAC: %02X:%02X:%02X:%02X:%02X:%02X\r\n",
+          s_local_mac[0], s_local_mac[1], s_local_mac[2],
+          s_local_mac[3], s_local_mac[4], s_local_mac[5]);
+    PRINT("[NET] Dynamic IP  : 192.168.1.%u\r\n", (unsigned int)s_local_ip_last_octet);
+    PRINT("[NET] Netmask     : 255.255.255.0\r\n");
+    PRINT("[NET] Gateway     : 192.168.1.1\r\n");
 
     /* Initialize Video + Telemetry Ethernet Streamer */
     Ethernet_Streamer_Init();
