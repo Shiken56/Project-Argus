@@ -40,7 +40,8 @@ LOCAL T_CTSK ctsk_cam = {
 
 /* Dynamic Hardware Identifiers derived from 96-bit UID */
 static uint8_t s_local_ip_last_octet = 10;
-static uint8_t s_local_mac[6] = {0x00, 0x80, 0xE1, 0x00, 0x00, 0x00};
+extern ETH_HandleTypeDef heth1;
+#define s_local_mac (heth1.Init.MACAddr)
 
 /* 3. Standard Ethernet Broadcast ARP Request */
 static void send_raw_arp_request(uint32_t seq)
@@ -84,14 +85,8 @@ LOCAL void net_task(INT stacd, void *exinf)
     uint32_t tx_timer = 0;
     uint32_t pkt_seq = 0;
 
-    /* Compute unique MAC & IP from STM32 factory 96-bit UID */
+    /* Compute unique IP from STM32 factory 96-bit UID */
     uint32_t uid_hash = HAL_GetUIDw0() ^ HAL_GetUIDw1() ^ HAL_GetUIDw2();
-    s_local_mac[0] = 0x00;
-    s_local_mac[1] = 0x80;
-    s_local_mac[2] = 0xE1;
-    s_local_mac[3] = (uint8_t)(uid_hash >> 16);
-    s_local_mac[4] = (uint8_t)(uid_hash >> 8);
-    s_local_mac[5] = (uint8_t)(uid_hash & 0xFF);
 
     /* Allocate dynamic last octet in range [20 .. 219], avoiding .1 (router) and .100 (laptop/PC) */
     s_local_ip_last_octet = 20 + (uint8_t)(uid_hash % 200);

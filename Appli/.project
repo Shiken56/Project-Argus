@@ -37,27 +37,27 @@
 		<link>
 			<name>Drivers/BSP</name>
 			<type>2</type>
-			<location>C:/Users/aayus/Documents/tron_26/master/mtk3bsp2_stm32n657/Drivers/BSP</location>
+			<locationURI>PARENT-1-PROJECT_LOC/Drivers/BSP</locationURI>
 		</link>
 		<link>
 			<name>Drivers/STM32N6xx_HAL_Driver</name>
 			<type>2</type>
-			<location>C:/Users/aayus/Documents/tron_26/master/mtk3bsp2_stm32n657/Drivers/STM32N6xx_HAL_Driver/Src</location>
+			<locationURI>PARENT-1-PROJECT_LOC/Drivers/STM32N6xx_HAL_Driver/Src</locationURI>
 		</link>
 		<link>
 			<name>Middlewares/AI</name>
 			<type>2</type>
-			<location>C:/Users/aayus/Documents/tron_26/master/mtk3bsp2_stm32n657/Middlewares/AI</location>
+			<locationURI>PARENT-1-PROJECT_LOC/Middlewares/AI</locationURI>
 		</link>
 		<link>
 			<name>Middlewares/Camera_Middleware</name>
 			<type>2</type>
-			<location>C:/Users/aayus/Documents/tron_26/master/mtk3bsp2_stm32n657/Middlewares/Camera_Middleware</location>
+			<locationURI>PARENT-1-PROJECT_LOC/Middlewares/Camera_Middleware</locationURI>
 		</link>
 		<link>
 			<name>Middlewares/Lwip</name>
 			<type>2</type>
-			<location>C:/Users/aayus/Documents/tron_26/master/mtk3bsp2_stm32n657/Middlewares/Lwip</location>
+			<locationURI>PARENT-1-PROJECT_LOC/Middlewares/Lwip</locationURI>
 		</link>
 	</linkedResources>
 </projectDescription>

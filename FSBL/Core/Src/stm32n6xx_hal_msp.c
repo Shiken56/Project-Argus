@@ -279,35 +279,22 @@ void HAL_XSPI_MspInit(XSPI_HandleTypeDef* hxspi)
     PP0     ------> XSPIM_P1_IO0
     PP4     ------> XSPIM_P1_IO4
     PP1     ------> XSPIM_P1_IO1
-    PP15     ------> XSPIM_P1_IO15
     PP5     ------> XSPIM_P1_IO5
-    PP12     ------> XSPIM_P1_IO12
     PP3     ------> XSPIM_P1_IO3
     PP2     ------> XSPIM_P1_IO2
-    PP13     ------> XSPIM_P1_IO13
     PO5     ------> XSPIM_P1_NCLK
     PO2     ------> XSPIM_P1_DQS0
-    PP11     ------> XSPIM_P1_IO11
-    PP8     ------> XSPIM_P1_IO8
-    PP14     ------> XSPIM_P1_IO14
-    PO3     ------> XSPIM_P1_DQS1
-    PO0     ------> XSPIM_P1_NCS1
-    PP9     ------> XSPIM_P1_IO9
-    PP10     ------> XSPIM_P1_IO10
     PO4     ------> XSPIM_P1_CLK
     */
     GPIO_InitStruct.Pin = HEXASPI_IO_7_Pin|HEXASPI_IO_6_Pin|HEXASPI_IO_0_Pin|HEXASPI_IO_4_Pin
-                          |HEXASPI_IO_1_Pin|HEXASPI_IO_15_Pin|HEXASPI_IO_5_Pin|HEXASPI_IO_12_Pin
-                          |HEXASPI_IO_3_Pin|HEXASPI_IO_2_Pin|HEXASPI_IO_13_Pin|HEXASPI_IO_11_Pin
-                          |HEXASPI_IO_8_Pin|HEXASPI_IO_14_Pin|HEXASPI_IO_9_Pin|HEXASPI_IO_10_Pin;
+                          |HEXASPI_IO_1_Pin|HEXASPI_IO_5_Pin|HEXASPI_IO_3_Pin|HEXASPI_IO_2_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     GPIO_InitStruct.Alternate = GPIO_AF9_XSPIM_P1;
     HAL_GPIO_Init(GPIOP, &GPIO_InitStruct);
 
-    GPIO_InitStruct.Pin = GPIO_PIN_5|HEXASPI_DQS0_Pin|HEXASPI_DQS1_Pin|HEXASPI_NCS_Pin
-                          |HEXASPI_CLK_Pin;
+    GPIO_InitStruct.Pin = GPIO_PIN_5|HEXASPI_DQS0_Pin|HEXASPI_CLK_Pin;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
@@ -399,30 +386,17 @@ void HAL_XSPI_MspDeInit(XSPI_HandleTypeDef* hxspi)
     PP0     ------> XSPIM_P1_IO0
     PP4     ------> XSPIM_P1_IO4
     PP1     ------> XSPIM_P1_IO1
-    PP15     ------> XSPIM_P1_IO15
     PP5     ------> XSPIM_P1_IO5
-    PP12     ------> XSPIM_P1_IO12
     PP3     ------> XSPIM_P1_IO3
     PP2     ------> XSPIM_P1_IO2
-    PP13     ------> XSPIM_P1_IO13
     PO5     ------> XSPIM_P1_NCLK
     PO2     ------> XSPIM_P1_DQS0
-    PP11     ------> XSPIM_P1_IO11
-    PP8     ------> XSPIM_P1_IO8
-    PP14     ------> XSPIM_P1_IO14
-    PO3     ------> XSPIM_P1_DQS1
-    PO0     ------> XSPIM_P1_NCS1
-    PP9     ------> XSPIM_P1_IO9
-    PP10     ------> XSPIM_P1_IO10
     PO4     ------> XSPIM_P1_CLK
     */
     HAL_GPIO_DeInit(GPIOP, HEXASPI_IO_7_Pin|HEXASPI_IO_6_Pin|HEXASPI_IO_0_Pin|HEXASPI_IO_4_Pin
-                          |HEXASPI_IO_1_Pin|HEXASPI_IO_15_Pin|HEXASPI_IO_5_Pin|HEXASPI_IO_12_Pin
-                          |HEXASPI_IO_3_Pin|HEXASPI_IO_2_Pin|HEXASPI_IO_13_Pin|HEXASPI_IO_11_Pin
-                          |HEXASPI_IO_8_Pin|HEXASPI_IO_14_Pin|HEXASPI_IO_9_Pin|HEXASPI_IO_10_Pin);
+                          |HEXASPI_IO_1_Pin|HEXASPI_IO_5_Pin|HEXASPI_IO_3_Pin|HEXASPI_IO_2_Pin);
 
-    HAL_GPIO_DeInit(GPIOO, GPIO_PIN_5|HEXASPI_DQS0_Pin|HEXASPI_DQS1_Pin|HEXASPI_NCS_Pin
-                          |HEXASPI_CLK_Pin);
+    HAL_GPIO_DeInit(GPIOO, GPIO_PIN_5|HEXASPI_DQS0_Pin|HEXASPI_CLK_Pin);
 
     /* XSPI1 interrupt DeInit */
     HAL_NVIC_DisableIRQ(XSPI1_IRQn);
