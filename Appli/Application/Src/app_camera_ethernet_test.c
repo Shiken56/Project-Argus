@@ -16,7 +16,7 @@
 #define PC_IP_1 192
 #define PC_IP_2 168
 #define PC_IP_3 1
-#define PC_IP_4 255  /* Subnet broadcast (192.168.1.255) - bypasses ARP resolution so UDP is sent immediately */
+#define PC_IP_4 100  /* Subnet broadcast (192.168.1.255) - bypasses ARP resolution so UDP is sent immediately */
 
 #define TARGET_PORT 5000
 #define UDP_CHUNK_PAYLOAD_SIZE 1400

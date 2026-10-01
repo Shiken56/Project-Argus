@@ -96,6 +96,7 @@ static void MX_DCMIPP_Init(void);
 static void MX_XSPI1_Init(void);
 static void MX_CACHEAXI_Init(void);
 static void MX_RAMCFG_Init(void);
+static void SystemIsolation_Config(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -149,6 +150,7 @@ int main(void)
   MX_XSPI1_Init();
   MX_CACHEAXI_Init();
   MX_RAMCFG_Init();
+  SystemIsolation_Config();
   /* USER CODE BEGIN 2 */
   /* Initialize the External PSRAM (HyperRAM) on XSPI1 */
   if (BSP_XSPI_RAM_Init(0) != 0)
@@ -162,6 +164,7 @@ int main(void)
       Error_Handler();
   }
 
+  HAL_Delay(1000);
   void knl_start_mtkernel(void);
   knl_start_mtkernel();
   /* USER CODE END 2 */
@@ -433,22 +436,18 @@ static void MX_ETH1_Init(void)
 
   /* USER CODE END ETH1_Init 0 */
 
-  static uint8_t MACAddr[6];
+   static uint8_t MACAddr[6];
 
   /* USER CODE BEGIN ETH1_Init 1 */
 
   /* USER CODE END ETH1_Init 1 */
   heth1.Instance = ETH1;
-
-  /* Derive unique, persistent MAC address from STM32 factory 96-bit hardware UID */
-  uint32_t uid_hash = HAL_GetUIDw0() ^ HAL_GetUIDw1() ^ HAL_GetUIDw2();
   MACAddr[0] = 0x00;
   MACAddr[1] = 0x80;
-  MACAddr[2] = 0xE1; /* STMicroelectronics vendor OUI */
-  MACAddr[3] = (uint8_t)(uid_hash >> 16);
-  MACAddr[4] = (uint8_t)(uid_hash >> 8);
-  MACAddr[5] = (uint8_t)(uid_hash & 0xFF);
-
+  MACAddr[2] = 0xE1;
+  MACAddr[3] = 0x00;
+  MACAddr[4] = 0x00;
+  MACAddr[5] = 0x00;
   heth1.Init.MACAddr = &MACAddr[0];
   heth1.Init.MediaInterface = HAL_ETH_RGMII_MODE;
   for (int ch = 0; ch < ETH_DMA_CH_CNT; ch++)
@@ -459,6 +458,16 @@ static void MX_ETH1_Init(void)
   heth1.Init.RxBuffLen = 1536;
 
   /* USER CODE BEGIN MACADDRESS */
+  /* Derive unique, persistent MAC address from STM32 factory 96-bit hardware UID */
+  uint32_t uid_hash = HAL_GetUIDw0() ^ HAL_GetUIDw1() ^ HAL_GetUIDw2();
+  MACAddr[0] = 0x00;
+  MACAddr[1] = 0x80;
+  MACAddr[2] = 0xE1; /* STMicroelectronics vendor OUI */
+  MACAddr[3] = (uint8_t)(uid_hash >> 16);
+  MACAddr[4] = (uint8_t)(uid_hash >> 8);
+  MACAddr[5] = (uint8_t)(uid_hash & 0xFF);
+  heth1.Init.MACAddr = &MACAddr[0];
+
   heth1.Init.RxDesc[0] = (ETH_DMADescTypeDef *)0x34100000;
   heth1.Init.RxDesc[1] = (ETH_DMADescTypeDef *)0x34100060;
   heth1.Init.TxDesc[0] = (ETH_DMADescTypeDef *)0x341000C0;
@@ -583,6 +592,114 @@ static void MX_RAMCFG_Init(void)
   /* USER CODE BEGIN RAMCFG_Init 2 */
 
   /* USER CODE END RAMCFG_Init 2 */
+
+}
+
+/**
+  * @brief RIF Initialization Function
+  * @param None
+  * @retval None
+  */
+  static void SystemIsolation_Config(void)
+{
+
+  /* USER CODE BEGIN RIF_Init 0 */
+
+  /* USER CODE END RIF_Init 0 */
+
+  /* set all required IPs as secure privileged */
+  __HAL_RCC_RIFSC_CLK_ENABLE();
+
+  /*RIMC configuration*/
+  RIMC_MasterConfig_t RIMC_master = {0};
+  RIMC_master.MasterCID = RIF_CID_1;
+  RIMC_master.SecPriv = RIF_ATTRIBUTE_SEC | RIF_ATTRIBUTE_PRIV;
+  HAL_RIF_RIMC_ConfigMasterAttributes(RIF_MASTER_INDEX_DCMIPP, &RIMC_master);
+
+  HAL_RIF_RIMC_ConfigMasterAttributes(RIF_MASTER_INDEX_ETH1, &RIMC_master);
+
+  /*RISUP configuration*/
+  HAL_RIF_RISC_SetSlaveSecureAttributes(RIF_RISC_PERIPH_INDEX_I2C1 , RIF_ATTRIBUTE_SEC | RIF_ATTRIBUTE_PRIV);
+  HAL_RIF_RISC_SetSlaveSecureAttributes(RIF_RISC_PERIPH_INDEX_ETH1 , RIF_ATTRIBUTE_SEC | RIF_ATTRIBUTE_PRIV);
+  HAL_RIF_RISC_SetSlaveSecureAttributes(RIF_RISC_PERIPH_INDEX_ADC12 , RIF_ATTRIBUTE_SEC | RIF_ATTRIBUTE_NPRIV);
+  HAL_RIF_RISC_SetSlaveSecureAttributes(RIF_RISC_PERIPH_INDEX_CSI , RIF_ATTRIBUTE_SEC | RIF_ATTRIBUTE_PRIV);
+  HAL_RIF_RISC_SetSlaveSecureAttributes(RIF_RISC_PERIPH_INDEX_DCMIPP , RIF_ATTRIBUTE_SEC | RIF_ATTRIBUTE_PRIV);
+  HAL_RIF_RISC_SetSlaveSecureAttributes(RIF_RISC_PERIPH_INDEX_NPU , RIF_ATTRIBUTE_SEC | RIF_ATTRIBUTE_PRIV);
+
+  /*IAC configuration*/
+  HAL_RIF_IAC_EnableIT(RIF_RISC_PERIPH_INDEX_CSI);
+  HAL_RIF_IAC_EnableIT(RIF_RISC_PERIPH_INDEX_DCMIPP);
+  HAL_RIF_IAC_EnableIT(RIF_RISC_PERIPH_INDEX_I2C1);
+
+  /* IAC interrupt Init */
+  HAL_NVIC_SetPriority(IAC_IRQn, 0x0, 0x0);
+  HAL_NVIC_EnableIRQ(IAC_IRQn);
+
+  /* RIF-Aware IPs Config */
+
+  /* set up GPIO configuration */
+  HAL_GPIO_ConfigPinAttributes(GPIOA,GPIO_PIN_5,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOA,GPIO_PIN_9,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOA,GPIO_PIN_10,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOA,GPIO_PIN_11,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOA,GPIO_PIN_12,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOB,GPIO_PIN_0,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOB,GPIO_PIN_6,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOB,GPIO_PIN_7,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOC,GPIO_PIN_1,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOC,GPIO_PIN_13,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOE,GPIO_PIN_2,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOE,GPIO_PIN_3,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOE,GPIO_PIN_5,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOE,GPIO_PIN_6,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOE,GPIO_PIN_7,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOE,GPIO_PIN_8,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOF,GPIO_PIN_4,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOG,GPIO_PIN_7,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOG,GPIO_PIN_10,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOH,GPIO_PIN_9,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPION,GPIO_PIN_0,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPION,GPIO_PIN_1,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPION,GPIO_PIN_2,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPION,GPIO_PIN_3,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPION,GPIO_PIN_4,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPION,GPIO_PIN_5,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPION,GPIO_PIN_6,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPION,GPIO_PIN_8,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPION,GPIO_PIN_9,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPION,GPIO_PIN_10,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPION,GPIO_PIN_11,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOO,GPIO_PIN_0,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOO,GPIO_PIN_1,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOO,GPIO_PIN_2,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOO,GPIO_PIN_3,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOO,GPIO_PIN_4,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOO,GPIO_PIN_5,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOP,GPIO_PIN_0,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOP,GPIO_PIN_1,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOP,GPIO_PIN_2,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOP,GPIO_PIN_3,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOP,GPIO_PIN_4,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOP,GPIO_PIN_5,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOP,GPIO_PIN_6,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOP,GPIO_PIN_7,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOP,GPIO_PIN_8,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOP,GPIO_PIN_9,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOP,GPIO_PIN_10,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOP,GPIO_PIN_11,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOP,GPIO_PIN_12,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOP,GPIO_PIN_13,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOP,GPIO_PIN_14,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+  HAL_GPIO_ConfigPinAttributes(GPIOP,GPIO_PIN_15,GPIO_PIN_SEC|GPIO_PIN_NPRIV);
+
+  /* USER CODE BEGIN RIF_Init 1 */
+
+  HAL_RIF_RIMC_ConfigMasterAttributes(RIF_MASTER_INDEX_NPU, &RIMC_master);
+
+  /* USER CODE END RIF_Init 1 */
+  /* USER CODE BEGIN RIF_Init 2 */
+
+  /* USER CODE END RIF_Init 2 */
 
 }
 
