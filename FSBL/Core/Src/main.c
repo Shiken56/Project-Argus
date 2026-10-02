@@ -125,10 +125,10 @@ int main(void)
   MX_XSPI2_Init();
   MX_EXTMEM_MANAGER_Init();
   /* USER CODE BEGIN 2 */
-//#ifdef DEBUG
-//  BOOTStatus_TypeDef JumpToApplication(void);
-//  JumpToApplication();
-//#endif
+#ifdef DEBUG
+  BOOTStatus_TypeDef JumpToApplication(void);
+  JumpToApplication();
+#endif
   /* USER CODE END 2 */
 
   /* Launch the application */

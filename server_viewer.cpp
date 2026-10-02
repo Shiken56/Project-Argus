@@ -30,6 +30,7 @@
 #define LISTEN_PORT 5000
 #define OD_MAX_BOXES 10
 #define REID_EMBEDDING_DIM 128
+#define MAX_CAMERAS 2
 
 // Real-time tunable threshold (default 75%, adjustable live from 40% to 98%)
 static std::atomic<float> g_reid_similarity_threshold(0.75f);
@@ -77,15 +78,16 @@ struct ReidMetadataPacket_t {
 };
 #pragma pack(pop)
 
-// UI Dimensions
+// UI Dimensions (Split-Screen: Cam 1 + Cam 2 + Sidebar)
 static const int FRAME_W = 256;
 static const int FRAME_H = 256;
 static const int DISP_W = 512;
 static const int DISP_H = 512;
+static const int TOTAL_DISP_W = DISP_W * MAX_CAMERAS; // 1024 px for 2 split screens
 static const int HEADER_H = 36;
 static const int SIDEBAR_W = 320;
-static const int TOTAL_W = DISP_W + SIDEBAR_W;
-static const int TOTAL_H = DISP_H + HEADER_H;
+static const int TOTAL_W = TOTAL_DISP_W + SIDEBAR_W;  // 1344 px
+static const int TOTAL_H = DISP_H + HEADER_H;         // 548 px
 
 // Distinct Neon/Vivid colors for identities
 static const COLORREF ID_COLORS[] = {
@@ -100,12 +102,13 @@ static const COLORREF ID_COLORS[] = {
 };
 static const int NUM_ID_COLORS = sizeof(ID_COLORS) / sizeof(ID_COLORS[0]);
 
-// ReID Profile Structure
+// ReID Profile Structure (Unified Gallery / Shared Pool across all IP cameras)
 struct PersonProfile {
     int id;
     std::vector<float> feature;              // L2 normalized representative feature vector
     COLORREF color;
     uint32_t last_seen_frame;
+    int last_cam_id;                         // Camera ID (1 or 2) that last observed this person
     int match_count;
     float last_similarity;
     std::chrono::steady_clock::time_point last_seen_time;
@@ -117,52 +120,60 @@ struct PersonMatchScore {
     float sim;
 };
 
-// Spatial Multi-Object Track Structure (IoU tracking)
+// Spatial Multi-Object Track Structure (IoU tracking per camera)
 struct ActiveTrack {
-    int track_id;               // Sequential Track ID (1, 2, ...)
-    int person_id;              // Confirmed Gallery Person ID (1, 2, ...) or 0 if unassigned
+    int track_id;               // Sequential Track ID (1, 2, ...) local to this camera
+    int person_id;              // Confirmed Shared Gallery Person ID (1, 2, ...) or 0 if unassigned
     float sim;                  // Last match similarity
     COLORREF color;             // Color associated with person or neutral
     DetectionBox_t box;         // Last known bounding box coordinates (cx, cy, w, h)
-    std::vector<PersonMatchScore> all_scores; // Similarity score with each person in gallery
+    std::vector<PersonMatchScore> all_scores; // Similarity score with each person in unified gallery
     std::chrono::steady_clock::time_point last_seen;
 };
-static std::vector<ActiveTrack> g_tracks;
-static int g_next_track_id = 1;
 
-// Dynamic Camera / Board IP Mapping
-static std::string g_active_board_ip = "Connecting...";
-static int g_active_camera_id = 1;
-static std::unordered_map<std::string, int> g_board_cam_map;
-static int g_next_cam_id = 1;
+// Per-Camera Stream State (Independent frame assembly, buffers & tracks per IP)
+struct CameraFeed {
+    std::string ip;
+    int cam_id = 0;                          // 1 or 2
+    bool active = false;
 
-static int register_or_get_camera_id(const std::string& ip) {
-    if (g_board_cam_map.find(ip) == g_board_cam_map.end()) {
-        int assigned = g_next_cam_id++;
-        g_board_cam_map[ip] = assigned;
-        std::cout << "\n[CAMERA REGISTRATION] Board IP " << ip << " registered as Camera #" << assigned << "\n\n";
-    }
-    return g_board_cam_map[ip];
-}
+    // Video chunk assembly & display buffers
+    std::vector<uint8_t> raw_frame_rgb;      // 256 * 256 * 3
+    std::vector<uint32_t> rgb32_buffer;      // 256 * 256 XRGB
+    uint32_t active_frame_id = 0;
+    uint32_t chunks_received = 0;
+    uint32_t current_frame_id = 0;
+    bool has_frame = false;
 
-// Thread Synchronization & Shared Data
+    // OD Metadata & Local Tracks
+    OdMetadataPacket_t latest_meta = {};
+    std::vector<ActiveTrack> tracks;
+    int next_track_id = 1;
+
+    // FPS & Telemetry
+    uint32_t frame_count = 0;
+    std::chrono::steady_clock::time_point fps_start;
+    double stream_fps = 0.0;
+    std::chrono::steady_clock::time_point last_packet_time;
+};
+
+// Synchronization & Shared Data
 static CRITICAL_SECTION g_cs;
-static std::vector<uint32_t> g_rgb32_buffer(FRAME_W * FRAME_H, 0); // 32-bit XRGB
-static OdMetadataPacket_t g_latest_meta = {};
-static uint32_t g_current_frame_id = 0;
-static double g_stream_fps = 0.0;
-static bool g_has_frame = false;
-static bool g_running = true;
+static CameraFeed g_cams[MAX_CAMERAS];
+static std::unordered_map<std::string, int> g_ip_to_cam_idx;
+static int g_num_registered_cams = 0;
 
-// ReID gallery & live raw embedding
+// Shared ReID gallery across both camera IPs & live raw embedding inspector
 static std::vector<PersonProfile> g_gallery;
 static std::vector<int8_t> g_raw_latest_embedding(REID_EMBEDDING_DIM, 0);
 static uint32_t g_latest_reid_box = 0;
 static uint32_t g_latest_reid_frame = 0;
+static int g_latest_reid_cam_id = 1;
 static uint32_t g_reid_total_count = 0;
 
-// Window Handle
+// Window & Execution State
 static HWND g_hwnd = NULL;
+static bool g_running = true;
 
 // Helper: Normalize clean UINT8 [0..255] vector directly (as emitted by firmware)
 static std::vector<float> normalize_int8_embedding(const int8_t* raw, size_t len) {
@@ -223,9 +234,34 @@ static float compute_iou(const DetectionBox_t& a, const DetectionBox_t& b) {
     return inter_area / union_area;
 }
 
-// (Cross-identity gallery merging filter removed per configuration)
+// Register or lookup camera index (0 or 1) by incoming IP address
+static int register_or_get_camera_slot(const std::string& ip) {
+    auto it = g_ip_to_cam_idx.find(ip);
+    if (it != g_ip_to_cam_idx.end()) {
+        return it->second;
+    }
 
+    int assigned_slot = -1;
+    if (g_num_registered_cams < MAX_CAMERAS) {
+        assigned_slot = g_num_registered_cams++;
+    } else {
+        // Fallback if more than 2 IPs: reuse slot 1
+        assigned_slot = 1;
+    }
 
+    g_ip_to_cam_idx[ip] = assigned_slot;
+    g_cams[assigned_slot].ip = ip;
+    g_cams[assigned_slot].cam_id = assigned_slot + 1;
+    g_cams[assigned_slot].active = true;
+    g_cams[assigned_slot].raw_frame_rgb.assign(FRAME_W * FRAME_H * 3, 0);
+    g_cams[assigned_slot].rgb32_buffer.assign(FRAME_W * FRAME_H, 0);
+    g_cams[assigned_slot].fps_start = std::chrono::steady_clock::now();
+
+    std::cout << "\n[CAMERA SLOT ASSIGNED] Board IP: " << ip
+              << " registered to Split-Screen Pane #" << (assigned_slot + 1) << " (Camera #" << (assigned_slot + 1) << ")\n\n";
+
+    return assigned_slot;
+}
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
@@ -234,18 +270,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             HDC hdc = BeginPaint(hwnd, &ps);
 
             EnterCriticalSection(&g_cs);
-            std::vector<uint32_t> local_pixels = g_rgb32_buffer;
-            OdMetadataPacket_t meta = g_latest_meta;
-            uint32_t frame_id = g_current_frame_id;
-            double fps = g_stream_fps;
-
-            std::vector<ActiveTrack> tracks_copy = g_tracks;
+            CameraFeed cams_copy[MAX_CAMERAS];
+            for (int i = 0; i < MAX_CAMERAS; i++) {
+                cams_copy[i] = g_cams[i];
+            }
             std::vector<PersonProfile> gallery_copy = g_gallery;
             std::vector<int8_t> latest_emb = g_raw_latest_embedding;
             uint32_t last_box = g_latest_reid_box;
             uint32_t last_reid_frame = g_latest_reid_frame;
+            int last_reid_cam = g_latest_reid_cam_id;
             uint32_t total_reid = g_reid_total_count;
             LeaveCriticalSection(&g_cs);
+
+            auto now = std::chrono::steady_clock::now();
 
             // Double buffering memory DC
             HDC memDC = CreateCompatibleDC(hdc);
@@ -267,7 +304,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             bmi.bmiHeader.biBitCount = 32;
             bmi.bmiHeader.biCompression = BI_RGB;
 
-            // 1. Top Header Banner
+            // 1. Top Header Banner across the full window width
             RECT bannerRect = {0, 0, TOTAL_W, HEADER_H};
             HBRUSH bannerBrush = CreateSolidBrush(RGB(22, 27, 34));
             FillRect(memDC, &bannerRect, bannerBrush);
@@ -278,179 +315,264 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             MoveToEx(memDC, 0, HEADER_H - 1, NULL);
             LineTo(memDC, TOTAL_W, HEADER_H - 1);
 
-            char bannerText[256];
-            snprintf(bannerText, sizeof(bannerText),
-                     "  CAM #%d [%s] | Frame #%u | Video: %.1f FPS | YOLO: %u ms | Tracks: %u | Thresh: %.0f%%",
-                     g_active_camera_id, g_active_board_ip.c_str(), frame_id, fps,
-                     (unsigned int)meta.inference_ms, (unsigned int)tracks_copy.size(),
-                     g_reid_similarity_threshold.load() * 100.0f);
-
-            SetTextColor(memDC, RGB(0, 240, 255));
-            SetBkMode(memDC, TRANSPARENT);
-            DrawTextA(memDC, bannerText, -1, &bannerRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
-
-            // 2. Video Frame Blit (512x512)
-            SetStretchBltMode(memDC, COLORONCOLOR);
-            StretchDIBits(memDC,
-                          0, HEADER_H, DISP_W, DISP_H,
-                          0, 0, FRAME_W, FRAME_H,
-                          local_pixels.data(),
-                          &bmi,
-                          DIB_RGB_COLORS,
-                          SRCCOPY);
-
-            // 3. Draw Bounding Boxes + Mutual-Exclusion Spatial Track Overlay
-            auto now = std::chrono::steady_clock::now();
-
-            // Match each detection box to the best active track (Greedy 1-to-1 matching)
-            std::vector<int> box_to_track(meta.num_boxes, -1);
-            std::vector<bool> track_used(tracks_copy.size(), false);
-
-            for (uint8_t i = 0; i < meta.num_boxes; i++) {
-                int best_t = -1;
-                float best_overlap = 0.15f; // minimum IoU or center proximity
-                for (size_t t = 0; t < tracks_copy.size(); t++) {
-                    if (track_used[t]) continue;
-                    float iou = compute_iou(meta.boxes[i], tracks_copy[t].box);
-                    // Also consider center distance if boxes are small
-                    float dx = meta.boxes[i].cx - tracks_copy[t].box.cx;
-                    float dy = meta.boxes[i].cy - tracks_copy[t].box.cy;
-                    float dist = std::sqrt(dx * dx + dy * dy);
-                    float score = iou + (dist < 0.15f ? (0.20f - dist) : 0.0f);
-
-                    if (score > best_overlap) {
-                        best_overlap = score;
-                        best_t = (int)t;
-                    }
-                }
-                if (best_t >= 0) {
-                    box_to_track[i] = best_t;
-                    track_used[best_t] = true;
-                }
+            // Banner Segment 1: Cam 1 (Left 512px)
+            RECT bRect1 = {10, 0, DISP_W - 10, HEADER_H};
+            char bText1[192];
+            if (cams_copy[0].active) {
+                snprintf(bText1, sizeof(bText1),
+                         "CAM #1 [%s] | Frame #%u | %.1f FPS | YOLO: %u ms | Tracks: %u",
+                         cams_copy[0].ip.c_str(), cams_copy[0].current_frame_id, cams_copy[0].stream_fps,
+                         (unsigned int)cams_copy[0].latest_meta.inference_ms,
+                         (unsigned int)cams_copy[0].tracks.size());
+                SetTextColor(memDC, RGB(0, 240, 255));
+            } else {
+                snprintf(bText1, sizeof(bText1), "CAM #1 [Awaiting IP Stream...]");
+                SetTextColor(memDC, RGB(120, 130, 145));
             }
+            SetBkMode(memDC, TRANSPARENT);
+            DrawTextA(memDC, bText1, -1, &bRect1, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
 
-            for (uint8_t i = 0; i < meta.num_boxes; i++) {
-                int cx = (int)(meta.boxes[i].cx * DISP_W);
-                int cy = (int)(meta.boxes[i].cy * DISP_H) + HEADER_H;
-                int bw = (int)(meta.boxes[i].w * DISP_W);
-                int bh = (int)(meta.boxes[i].h * DISP_H);
+            // Vertical divider between Cam 1 and Cam 2 banners
+            MoveToEx(memDC, DISP_W, 0, NULL);
+            LineTo(memDC, DISP_W, HEADER_H);
 
-                int x1 = (std::max)(0, cx - bw / 2);
-                int y1 = (std::max)(HEADER_H, cy - bh / 2);
-                int x2 = (std::min)(DISP_W - 1, cx + bw / 2);
-                int y2 = (std::min)(HEADER_H + DISP_H - 1, cy + bh / 2);
+            // Banner Segment 2: Cam 2 (Middle 512px)
+            RECT bRect2 = {DISP_W + 10, 0, TOTAL_DISP_W - 10, HEADER_H};
+            char bText2[192];
+            if (cams_copy[1].active) {
+                snprintf(bText2, sizeof(bText2),
+                         "CAM #2 [%s] | Frame #%u | %.1f FPS | YOLO: %u ms | Tracks: %u",
+                         cams_copy[1].ip.c_str(), cams_copy[1].current_frame_id, cams_copy[1].stream_fps,
+                         (unsigned int)cams_copy[1].latest_meta.inference_ms,
+                         (unsigned int)cams_copy[1].tracks.size());
+                SetTextColor(memDC, RGB(50, 255, 120));
+            } else {
+                snprintf(bText2, sizeof(bText2), "CAM #2 [Standby / Awaiting 2nd IP...]");
+                SetTextColor(memDC, RGB(120, 130, 145));
+            }
+            DrawTextA(memDC, bText2, -1, &bRect2, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
 
-                int assigned_track = box_to_track[i];
-                COLORREF box_color = RGB(160, 160, 160); // Neutral grey if unassigned
-                char label[96];
-                int conf_pct = (int)(meta.boxes[i].conf * 100.0f);
+            // Vertical divider between Cam 2 and Sidebar banner
+            MoveToEx(memDC, TOTAL_DISP_W, 0, NULL);
+            LineTo(memDC, TOTAL_DISP_W, HEADER_H);
 
-                if (assigned_track >= 0 && assigned_track < (int)tracks_copy.size()) {
-                    const auto& trk = tracks_copy[assigned_track];
-                    box_color = trk.color;
-                    if (trk.person_id > 0) {
-                        snprintf(label, sizeof(label), " Person #%d (%d%%) | Conf: %d%% ",
-                                 trk.person_id, (int)(trk.sim * 100.0f), conf_pct);
-                    } else {
-                        snprintf(label, sizeof(label), " Track #%d [Scanning...] | Conf: %d%% ",
-                                 trk.track_id, conf_pct);
-                    }
-                } else {
-                    snprintf(label, sizeof(label), " Box #%u | Conf: %d%% ", i, conf_pct);
-                }
+            // Banner Segment 3: Shared Pool Status (Right Sidebar header)
+            RECT bRectPool = {TOTAL_DISP_W + 10, 0, TOTAL_W - 10, HEADER_H};
+            char bTextPool[128];
+            snprintf(bTextPool, sizeof(bTextPool),
+                     "SHARED POOL | Thresh: %.0f%% | IDs: %u",
+                     g_reid_similarity_threshold.load() * 100.0f,
+                     (unsigned int)gallery_copy.size());
+            SetTextColor(memDC, RGB(255, 200, 50));
+            DrawTextA(memDC, bTextPool, -1, &bRectPool, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
 
-                HPEN boxPen = CreatePen(PS_SOLID, 3, box_color);
-                SelectObject(memDC, boxPen);
-                HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, GetStockObject(HOLLOW_BRUSH));
+            // 2. Render Both Camera Viewports (Split Screen)
+            SetStretchBltMode(memDC, COLORONCOLOR);
 
-                Rectangle(memDC, x1, y1, x2, y2);
+            for (int c = 0; c < MAX_CAMERAS; c++) {
+                int view_x = c * DISP_W;
+                int view_y = HEADER_H;
+                const auto& cam = cams_copy[c];
 
-                // Label Banner above bounding box
-                RECT labelRect = {x1, (std::max)(HEADER_H, y1 - 22), x1 + 205, y1};
-                HBRUSH labelBg = CreateSolidBrush(box_color);
-                FillRect(memDC, &labelRect, labelBg);
-                DeleteObject(labelBg);
+                if (cam.has_frame && !cam.rgb32_buffer.empty()) {
+                    // Blit 512x512 video frame
+                    StretchDIBits(memDC,
+                                  view_x, view_y, DISP_W, DISP_H,
+                                  0, 0, FRAME_W, FRAME_H,
+                                  cam.rgb32_buffer.data(),
+                                  &bmi,
+                                  DIB_RGB_COLORS,
+                                  SRCCOPY);
 
-                SetTextColor(memDC, RGB(0, 0, 0));
-                DrawTextA(memDC, label, -1, &labelRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+                    // Overlay Bounding Boxes + Mutual-Exclusion Spatial Tracks for this camera
+                    const auto& meta = cam.latest_meta;
+                    const auto& trks = cam.tracks;
 
-                // Corner Badge: small text list of similarity scores against all gallery persons (e.g. p1 - 85%, p2 - 42%)
-                if (assigned_track >= 0 && assigned_track < (int)tracks_copy.size()) {
-                    const auto& trk = tracks_copy[assigned_track];
-                    if (!trk.all_scores.empty()) {
-                        int num_scores = (int)trk.all_scores.size();
-                        int badge_w = 72;
-                        int badge_h = num_scores * 15 + 4;
-                        // Position badge inside the top-right corner of the bounding box (or top-left if box is near right edge)
-                        int badge_x = (x2 - badge_w - 4 >= x1) ? (x2 - badge_w - 4) : (x1 + 4);
-                        int badge_y = y1 + 4;
+                    // Match each detection box to the best active track (Greedy 1-to-1 matching)
+                    std::vector<int> box_to_track(meta.num_boxes, -1);
+                    std::vector<bool> track_used(trks.size(), false);
 
-                        RECT badgeRect = {badge_x, badge_y, badge_x + badge_w, badge_y + badge_h};
-                        HBRUSH badgeBg = CreateSolidBrush(RGB(15, 20, 28));
-                        FillRect(memDC, &badgeRect, badgeBg);
-                        DeleteObject(badgeBg);
+                    for (uint8_t i = 0; i < meta.num_boxes; i++) {
+                        int best_t = -1;
+                        float best_overlap = 0.15f;
+                        for (size_t t = 0; t < trks.size(); t++) {
+                            if (track_used[t]) continue;
+                            float iou = compute_iou(meta.boxes[i], trks[t].box);
+                            float dx = meta.boxes[i].cx - trks[t].box.cx;
+                            float dy = meta.boxes[i].cy - trks[t].box.cy;
+                            float dist = std::sqrt(dx * dx + dy * dy);
+                            float score = iou + (dist < 0.15f ? (0.20f - dist) : 0.0f);
 
-                        HPEN badgePen = CreatePen(PS_SOLID, 1, RGB(48, 54, 61));
-                        SelectObject(memDC, badgePen);
-                        SelectObject(memDC, GetStockObject(HOLLOW_BRUSH));
-                        Rectangle(memDC, badgeRect.left, badgeRect.top, badgeRect.right, badgeRect.bottom);
-                        SelectObject(memDC, oldPen);
-                        DeleteObject(badgePen);
-
-                        float live_thresh = g_reid_similarity_threshold.load();
-                        int row_y = badge_y + 2;
-                        for (const auto& ms : trk.all_scores) {
-                            char scoreStr[32];
-                            snprintf(scoreStr, sizeof(scoreStr), "p%d - %d%%", ms.person_id, (int)(ms.sim * 100.0f));
-                            RECT scoreRowRect = {badge_x + 5, row_y, badge_x + badge_w - 3, row_y + 14};
-                            // Highlight in bright green if >= threshold, else light grey
-                            COLORREF textColor = (ms.sim >= live_thresh) ? RGB(50, 255, 120) : RGB(180, 190, 200);
-                            SetTextColor(memDC, textColor);
-                            DrawTextA(memDC, scoreStr, -1, &scoreRowRect, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
-                            row_y += 15;
+                            if (score > best_overlap) {
+                                best_overlap = score;
+                                best_t = (int)t;
+                            }
+                        }
+                        if (best_t >= 0) {
+                            box_to_track[i] = best_t;
+                            track_used[best_t] = true;
                         }
                     }
+
+                    for (uint8_t i = 0; i < meta.num_boxes; i++) {
+                        int cx = view_x + (int)(meta.boxes[i].cx * DISP_W);
+                        int cy = view_y + (int)(meta.boxes[i].cy * DISP_H);
+                        int bw = (int)(meta.boxes[i].w * DISP_W);
+                        int bh = (int)(meta.boxes[i].h * DISP_H);
+
+                        int x1 = (std::max)(view_x, cx - bw / 2);
+                        int y1 = (std::max)(view_y, cy - bh / 2);
+                        int x2 = (std::min)(view_x + DISP_W - 1, cx + bw / 2);
+                        int y2 = (std::min)(view_y + DISP_H - 1, cy + bh / 2);
+
+                        int assigned_track = box_to_track[i];
+                        COLORREF box_color = RGB(160, 160, 160);
+                        char label[96];
+                        int conf_pct = (int)(meta.boxes[i].conf * 100.0f);
+
+                        if (assigned_track >= 0 && assigned_track < (int)trks.size()) {
+                            const auto& trk = trks[assigned_track];
+                            box_color = trk.color;
+                            if (trk.person_id > 0) {
+                                snprintf(label, sizeof(label), " Person #%d (%d%%) | Conf: %d%% ",
+                                         trk.person_id, (int)(trk.sim * 100.0f), conf_pct);
+                            } else {
+                                snprintf(label, sizeof(label), " Track #%d [Scanning...] | Conf: %d%% ",
+                                         trk.track_id, conf_pct);
+                            }
+                        } else {
+                            snprintf(label, sizeof(label), " Box #%u | Conf: %d%% ", i, conf_pct);
+                        }
+
+                        HPEN boxPen = CreatePen(PS_SOLID, 3, box_color);
+                        SelectObject(memDC, boxPen);
+                        HBRUSH oldBrush = (HBRUSH)SelectObject(memDC, GetStockObject(HOLLOW_BRUSH));
+
+                        Rectangle(memDC, x1, y1, x2, y2);
+
+                        // Label Banner above bounding box
+                        RECT labelRect = {x1, (std::max)(view_y, y1 - 22), x1 + 205, y1};
+                        HBRUSH labelBg = CreateSolidBrush(box_color);
+                        FillRect(memDC, &labelRect, labelBg);
+                        DeleteObject(labelBg);
+
+                        SetTextColor(memDC, RGB(0, 0, 0));
+                        DrawTextA(memDC, label, -1, &labelRect, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+
+                        // Corner Badge: Similarity scores against gallery persons
+                        if (assigned_track >= 0 && assigned_track < (int)trks.size()) {
+                            const auto& trk = trks[assigned_track];
+                            if (!trk.all_scores.empty()) {
+                                int num_scores = (int)trk.all_scores.size();
+                                int badge_w = 72;
+                                int badge_h = num_scores * 15 + 4;
+                                int badge_x = (x2 - badge_w - 4 >= x1) ? (x2 - badge_w - 4) : (x1 + 4);
+                                int badge_y = y1 + 4;
+
+                                RECT badgeRect = {badge_x, badge_y, badge_x + badge_w, badge_y + badge_h};
+                                HBRUSH badgeBg = CreateSolidBrush(RGB(15, 20, 28));
+                                FillRect(memDC, &badgeRect, badgeBg);
+                                DeleteObject(badgeBg);
+
+                                HPEN badgePen = CreatePen(PS_SOLID, 1, RGB(48, 54, 61));
+                                SelectObject(memDC, badgePen);
+                                SelectObject(memDC, GetStockObject(HOLLOW_BRUSH));
+                                Rectangle(memDC, badgeRect.left, badgeRect.top, badgeRect.right, badgeRect.bottom);
+                                SelectObject(memDC, oldPen);
+                                DeleteObject(badgePen);
+
+                                float live_thresh = g_reid_similarity_threshold.load();
+                                int row_y = badge_y + 2;
+                                for (const auto& ms : trk.all_scores) {
+                                    char scoreStr[32];
+                                    snprintf(scoreStr, sizeof(scoreStr), "p%d - %d%%", ms.person_id, (int)(ms.sim * 100.0f));
+                                    RECT scoreRowRect = {badge_x + 5, row_y, badge_x + badge_w - 3, row_y + 14};
+                                    COLORREF textColor = (ms.sim >= live_thresh) ? RGB(50, 255, 120) : RGB(180, 190, 200);
+                                    SetTextColor(memDC, textColor);
+                                    DrawTextA(memDC, scoreStr, -1, &scoreRowRect, DT_SINGLELINE | DT_LEFT | DT_VCENTER);
+                                    row_y += 15;
+                                }
+                            }
+                        }
+
+                        // Bottom coordinates tag
+                        char coordStr[64];
+                        snprintf(coordStr, sizeof(coordStr), "cx=%.2f cy=%.2f w=%.2f h=%.2f",
+                                 meta.boxes[i].cx, meta.boxes[i].cy, meta.boxes[i].w, meta.boxes[i].h);
+                        RECT coordRect = {x1, y2, x1 + 185, y2 + 16};
+                        SetTextColor(memDC, RGB(200, 200, 200));
+                        DrawTextA(memDC, coordStr, -1, &coordRect, DT_SINGLELINE | DT_LEFT);
+
+                        SelectObject(memDC, oldBrush);
+                        SelectObject(memDC, oldPen);
+                        DeleteObject(boxPen);
+                    }
+                } else {
+                    // Camera feed in Standby / Waiting mode
+                    RECT standbyRect = {view_x, view_y, view_x + DISP_W, view_y + DISP_H};
+                    HBRUSH standbyBrush = CreateSolidBrush(RGB(18, 21, 28));
+                    FillRect(memDC, &standbyRect, standbyBrush);
+                    DeleteObject(standbyBrush);
+
+                    // Crosshair grid lines
+                    HPEN gridPen = CreatePen(PS_DOT, 1, RGB(35, 42, 54));
+                    SelectObject(memDC, gridPen);
+                    MoveToEx(memDC, view_x, view_y + DISP_H / 2, NULL);
+                    LineTo(memDC, view_x + DISP_W, view_y + DISP_H / 2);
+                    MoveToEx(memDC, view_x + DISP_W / 2, view_y, NULL);
+                    LineTo(memDC, view_x + DISP_W / 2, view_y + DISP_H);
+                    SelectObject(memDC, oldPen);
+                    DeleteObject(gridPen);
+
+                    char standbyText[256];
+                    if (cam.active) {
+                        snprintf(standbyText, sizeof(standbyText),
+                                 "[ CAMERA #%d CONNECTED ]\nIP: %s\nReceiving initial video chunks...",
+                                 c + 1, cam.ip.c_str());
+                    } else {
+                        snprintf(standbyText, sizeof(standbyText),
+                                 "[ CAMERA #%d STANDBY ]\nListening on UDP Port %d\nAwaiting stream from STM32 IP #%d...",
+                                 c + 1, LISTEN_PORT, c + 1);
+                    }
+
+                    RECT txtRect = {view_x + 20, view_y + DISP_H / 2 - 40, view_x + DISP_W - 20, view_y + DISP_H / 2 + 50};
+                    SetTextColor(memDC, RGB(110, 120, 135));
+                    DrawTextA(memDC, standbyText, -1, &txtRect, DT_CENTER);
                 }
 
-                // Bottom coordinates tag
-                char coordStr[64];
-                snprintf(coordStr, sizeof(coordStr), "cx=%.2f cy=%.2f w=%.2f h=%.2f",
-                         meta.boxes[i].cx, meta.boxes[i].cy, meta.boxes[i].w, meta.boxes[i].h);
-                RECT coordRect = {x1, y2, x1 + 185, y2 + 16};
-                SetTextColor(memDC, RGB(200, 200, 200));
-                DrawTextA(memDC, coordStr, -1, &coordRect, DT_SINGLELINE | DT_LEFT);
-
-                SelectObject(memDC, oldBrush);
-                SelectObject(memDC, oldPen);
-                DeleteObject(boxPen);
+                // Vertical border between the split viewports
+                if (c == 0) {
+                    MoveToEx(memDC, DISP_W, HEADER_H, NULL);
+                    LineTo(memDC, DISP_W, TOTAL_H);
+                }
             }
 
-            // 4. Right Sidebar: ReID Gallery & Live Embedding Inspector
-            RECT sidebarRect = {DISP_W, HEADER_H, TOTAL_W, TOTAL_H};
+            // 3. Right Sidebar: Unified ReID Gallery & Controls (X = 1024 to 1344)
+            int sbX = TOTAL_DISP_W;
+            RECT sidebarRect = {sbX, HEADER_H, TOTAL_W, TOTAL_H};
             HBRUSH sideBrush = CreateSolidBrush(RGB(18, 22, 30));
             FillRect(memDC, &sidebarRect, sideBrush);
             DeleteObject(sideBrush);
 
-            // Vertical divider line between Video and Sidebar
-            MoveToEx(memDC, DISP_W, HEADER_H, NULL);
-            LineTo(memDC, DISP_W, TOTAL_H);
+            // Vertical divider line between Cam 2 and Sidebar
+            MoveToEx(memDC, sbX, HEADER_H, NULL);
+            LineTo(memDC, sbX, TOTAL_H);
 
-            // Sidebar Section 1: Gallery
-            RECT titleRect = {DISP_W + 12, HEADER_H + 10, TOTAL_W - 12, HEADER_H + 28};
+            // Sidebar Section 1: Unified ReID Identities
+            RECT titleRect = {sbX + 12, HEADER_H + 10, TOTAL_W - 12, HEADER_H + 28};
             SetTextColor(memDC, RGB(255, 255, 255));
-            DrawTextA(memDC, "IDENTITIES IN GALLERY", -1, &titleRect, DT_SINGLELINE | DT_LEFT);
+            DrawTextA(memDC, "SHARED REID GALLERY (BOTH CAMS)", -1, &titleRect, DT_SINGLELINE | DT_LEFT);
 
-            // Divider
-            MoveToEx(memDC, DISP_W + 10, HEADER_H + 32, NULL);
+            MoveToEx(memDC, sbX + 10, HEADER_H + 32, NULL);
             LineTo(memDC, TOTAL_W - 10, HEADER_H + 32);
 
             int cardY = HEADER_H + 38;
-            for (size_t i = 0; i < gallery_copy.size() && i < 2; i++) {
+            for (size_t i = 0; i < gallery_copy.size() && i < 3; i++) {
                 const auto& p = gallery_copy[i];
                 double age = std::chrono::duration<double>(now - p.last_seen_time).count();
                 bool is_active = (age < 3.0);
 
-                RECT cardRect = {DISP_W + 12, cardY, TOTAL_W - 12, cardY + 44};
+                RECT cardRect = {sbX + 12, cardY, TOTAL_W - 12, cardY + 44};
                 HBRUSH cardBg = CreateSolidBrush(is_active ? RGB(26, 33, 44) : RGB(22, 27, 34));
                 FillRect(memDC, &cardRect, cardBg);
                 DeleteObject(cardBg);
@@ -468,9 +590,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 FillRect(memDC, &pillRect, pillBrush);
                 DeleteObject(pillBrush);
 
-                // Header
+                // Header with Last Seen Camera ID
                 char idHeader[64];
-                snprintf(idHeader, sizeof(idHeader), "Person #%d  %s", p.id, is_active ? "[ACTIVE]" : "[LOST]");
+                snprintf(idHeader, sizeof(idHeader), "Person #%d  %s [Cam #%d]",
+                         p.id, is_active ? "[ACTIVE]" : "[LOST]", p.last_cam_id);
                 RECT idTextRect = {cardRect.left + 22, cardRect.top + 4, cardRect.right - 8, cardRect.top + 20};
                 SetTextColor(memDC, is_active ? p.color : RGB(140, 140, 140));
                 DrawTextA(memDC, idHeader, -1, &idTextRect, DT_SINGLELINE | DT_LEFT);
@@ -487,16 +610,23 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
 
             if (gallery_copy.empty()) {
-                RECT noGalleryRect = {DISP_W + 12, cardY + 4, TOTAL_W - 12, cardY + 28};
+                RECT noGalleryRect = {sbX + 12, cardY + 4, TOTAL_W - 12, cardY + 28};
                 SetTextColor(memDC, RGB(110, 118, 129));
-                DrawTextA(memDC, "Awaiting person detections...", -1, &noGalleryRect, DT_LEFT);
+                DrawTextA(memDC, "Awaiting person detections from IP streams...", -1, &noGalleryRect, DT_LEFT);
                 cardY += 32;
+            } else if (gallery_copy.size() > 3) {
+                char moreTxt[64];
+                snprintf(moreTxt, sizeof(moreTxt), "+%u more identities in shared gallery pool", (unsigned int)(gallery_copy.size() - 3));
+                RECT moreRect = {sbX + 12, cardY + 2, TOTAL_W - 12, cardY + 18};
+                SetTextColor(memDC, RGB(0, 180, 216));
+                DrawTextA(memDC, moreTxt, -1, &moreRect, DT_LEFT);
+                cardY += 22;
             }
 
             // Sidebar Section 2: Real-time Tunable Matching Threshold Card
             float cur_thresh = g_reid_similarity_threshold.load();
-            int ctrlY = (std::max)(cardY + 8, HEADER_H + 95);
-            RECT ctrlCard = {DISP_W + 12, ctrlY, TOTAL_W - 12, ctrlY + 100};
+            int ctrlY = (std::max)(cardY + 8, HEADER_H + 180);
+            RECT ctrlCard = {sbX + 12, ctrlY, TOTAL_W - 12, ctrlY + 100};
             HBRUSH ctrlBg = CreateSolidBrush(RGB(22, 27, 34));
             FillRect(memDC, &ctrlCard, ctrlBg);
             DeleteObject(ctrlBg);
@@ -586,18 +716,17 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
             // Sidebar Section 3: Live 128-Byte Embedding Inspector
             int embY = ctrlY + 108;
-            RECT embTitleRect = {DISP_W + 12, embY, TOTAL_W - 12, embY + 18};
+            RECT embTitleRect = {sbX + 12, embY, TOTAL_W - 12, embY + 18};
             SetTextColor(memDC, RGB(0, 240, 255));
             char embHeader[64];
-            snprintf(embHeader, sizeof(embHeader), "LATEST 128-BYTE EMBEDDING (Box #%u)", last_box);
+            snprintf(embHeader, sizeof(embHeader), "LATEST EMBEDDING (Cam #%d, Box #%u)", last_reid_cam, last_box);
             DrawTextA(memDC, embHeader, -1, &embTitleRect, DT_SINGLELINE | DT_LEFT);
 
-            MoveToEx(memDC, DISP_W + 10, embY + 22, NULL);
+            MoveToEx(memDC, sbX + 10, embY + 22, NULL);
             LineTo(memDC, TOTAL_W - 10, embY + 22);
 
-            // Display sample rows of 128-byte INT8 embedding
             int rowY = embY + 26;
-            for (int row = 0; row < 7 && row * 16 < REID_EMBEDDING_DIM; row++) {
+            for (int row = 0; row < 5 && row * 16 < REID_EMBEDDING_DIM; row++) {
                 char rowStr[128] = {};
                 int offset = 0;
                 offset += snprintf(rowStr + offset, sizeof(rowStr) - offset, "[%02d..%02d] ", row * 16, row * 16 + 15);
@@ -605,21 +734,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     int idx = row * 16 + col;
                     offset += snprintf(rowStr + offset, sizeof(rowStr) - offset, "%4d", (int)latest_emb[idx]);
                 }
-                RECT rowRect = {DISP_W + 12, rowY, TOTAL_W - 12, rowY + 15};
+                RECT rowRect = {sbX + 12, rowY, TOTAL_W - 12, rowY + 14};
                 SetTextColor(memDC, RGB(180, 190, 205));
                 DrawTextA(memDC, rowStr, -1, &rowRect, DT_SINGLELINE | DT_LEFT);
-                rowY += 15;
+                rowY += 14;
             }
 
             // Bottom Controls Banner
-            RECT diagRect = {DISP_W + 12, TOTAL_H - 52, TOTAL_W - 12, TOTAL_H - 8};
+            RECT diagRect = {sbX + 12, TOTAL_H - 46, TOTAL_W - 12, TOTAL_H - 6};
             HBRUSH diagBg = CreateSolidBrush(RGB(13, 17, 23));
             FillRect(memDC, &diagRect, diagBg);
             DeleteObject(diagBg);
 
             char diagStr[128];
             snprintf(diagStr, sizeof(diagStr),
-                     "[UP/DN/Wheel] Thresh  [0] Reset Thresh\n[R] Reset Gallery     [ESC/Q] Exit");
+                     "[UP/DN/Wheel] Thresh  [0] Reset Thresh\n[R] Reset Shared Pool [ESC/Q] Exit");
             SetTextColor(memDC, RGB(110, 118, 129));
             DrawTextA(memDC, diagStr, -1, &diagRect, DT_LEFT);
 
@@ -639,27 +768,28 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_LBUTTONDOWN: {
             int mx = LOWORD(lParam);
             int my = HIWORD(lParam);
+            int sbX = TOTAL_DISP_W;
 
-            // Check if clicked in threshold card (x: DISP_W + 12 to TOTAL_W - 12)
-            if (mx >= DISP_W + 12 && mx <= TOTAL_W - 12 && my >= 130 && my <= 260) {
+            // Check if clicked in threshold card (x: sbX + 12 to TOTAL_W - 12)
+            if (mx >= sbX + 12 && mx <= TOTAL_W - 12 && my >= 180 && my <= 320) {
                 float cur = g_reid_similarity_threshold.load();
 
-                // 1. [-] Button (x: DISP_W + 22 to DISP_W + 54, y: 172 to 198)
-                if (mx >= DISP_W + 22 && mx <= DISP_W + 54 && my >= 170 && my <= 200) {
+                // 1. [-] Button
+                if (mx >= sbX + 22 && mx <= sbX + 54 && my >= 220 && my <= 250) {
                     cur -= 0.02f;
                 }
-                // 2. [+] Button (x: TOTAL_W - 54 to TOTAL_W - 22, y: 172 to 198)
-                else if (mx >= TOTAL_W - 54 && mx <= TOTAL_W - 22 && my >= 170 && my <= 200) {
+                // 2. [+] Button
+                else if (mx >= TOTAL_W - 54 && mx <= TOTAL_W - 22 && my >= 220 && my <= 250) {
                     cur += 0.02f;
                 }
-                // 3. Slider Track (x: DISP_W + 62 to TOTAL_W - 62, y: 172 to 200)
-                else if (mx >= DISP_W + 62 && mx <= TOTAL_W - 62 && my >= 170 && my <= 200) {
-                    float ratio = (float)(mx - (DISP_W + 62)) / (float)((TOTAL_W - 62) - (DISP_W + 62));
+                // 3. Slider Track
+                else if (mx >= sbX + 62 && mx <= TOTAL_W - 62 && my >= 220 && my <= 250) {
+                    float ratio = (float)(mx - (sbX + 62)) / (float)((TOTAL_W - 62) - (sbX + 62));
                     cur = 0.40f + ratio * (0.95f - 0.40f);
                 }
-                // 4. Presets (y: 202 to 226): [60%] [70%] [75%] [80%] [88%]
-                else if (my >= 202 && my <= 226) {
-                    int pStartX = DISP_W + 22;
+                // 4. Presets: [60%] [70%] [75%] [80%] [88%]
+                else if (my >= 252 && my <= 276) {
+                    int pStartX = sbX + 22;
                     int pW = 50;
                     int pGap = 6;
                     const float preset_vals[] = {0.60f, 0.70f, 0.75f, 0.80f, 0.88f};
@@ -720,10 +850,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             } else if (wParam == 'R' || wParam == 'r') {
                 EnterCriticalSection(&g_cs);
                 g_gallery.clear();
-                g_tracks.clear();
-                g_next_track_id = 1;
+                for (int c = 0; c < MAX_CAMERAS; c++) {
+                    g_cams[c].tracks.clear();
+                    g_cams[c].next_track_id = 1;
+                }
                 LeaveCriticalSection(&g_cs);
-                std::cout << "[*] ReID Gallery & Tracks Reset.\n";
+                std::cout << "[*] Shared ReID Gallery & All Camera Tracks Reset.\n";
                 InvalidateRect(hwnd, NULL, FALSE);
             } else if (wParam == VK_ESCAPE || wParam == 'Q' || wParam == 'q') {
                 g_running = false;
@@ -755,7 +887,7 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
         return 1;
     }
 
-    int rcvbuf = 4 * 1024 * 1024;
+    int rcvbuf = 8 * 1024 * 1024; // 8MB buffer for multi-camera streaming
     setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (char*)&rcvbuf, sizeof(rcvbuf));
 
     sockaddr_in server_addr = {};
@@ -771,21 +903,13 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
     }
 
     std::cout << "=========================================================\n";
-    std::cout << "  STM32N6 Object Detection & ReID Viewer Server          \n";
+    std::cout << "  STM32N6 Dual-Camera Split-Screen ReID Viewer Server   \n";
     std::cout << "=========================================================\n";
     std::cout << "[+] UDP Server listening on port " << LISTEN_PORT << "...\n";
-    std::cout << "[+] ReID Matching Threshold: " << (int)(g_reid_similarity_threshold.load() * 100.0f) << "%\n";
-    std::cout << "    Use Mouse Wheel or Up/Down arrows to adjust in real-time!\n";
+    std::cout << "[+] Shared ReID Matching Threshold: " << (int)(g_reid_similarity_threshold.load() * 100.0f) << "%\n";
+    std::cout << "    Split screen active: Left=Cam#1, Right=Cam#2, Shared ReID Pool\n";
 
     std::vector<uint8_t> recv_buf(2048);
-    std::vector<uint8_t> raw_frame_rgb(FRAME_W * FRAME_H * 3, 0);
-
-    OdMetadataPacket_t current_meta = {};
-    uint32_t active_frame_id = 0;
-    uint32_t chunks_received = 0;
-
-    auto fps_start = std::chrono::steady_clock::now();
-    uint32_t frame_count = 0;
 
     while (g_running) {
         sockaddr_in client_addr;
@@ -797,13 +921,14 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
         memcpy(&magic, recv_buf.data(), sizeof(uint32_t));
         if (magic != STREAM_MAGIC) continue;
 
-        // Extract client IP and map to Camera ID
+        // Extract client IP and map to unique Camera slot (Cam 1 or Cam 2)
         std::string client_ip_str = inet_ntoa(client_addr.sin_addr);
-        int cam_id = register_or_get_camera_id(client_ip_str);
-        g_active_board_ip = client_ip_str;
-        g_active_camera_id = cam_id;
+        int cam_idx = register_or_get_camera_slot(client_ip_str);
+        if (cam_idx < 0 || cam_idx >= MAX_CAMERAS) continue;
 
         uint8_t pkt_type = recv_buf[4];
+        auto now_t = std::chrono::steady_clock::now();
+        g_cams[cam_idx].last_packet_time = now_t;
 
         // 1. ReID Metadata Packet
         if (pkt_type == PKT_TYPE_REID_METADATA && bytes >= (int)(sizeof(uint32_t) + sizeof(uint8_t) + sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint32_t))) {
@@ -817,16 +942,16 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
             int box_idx = (int)reid_pkt.box_index;
 
             EnterCriticalSection(&g_cs);
-            auto now_t = std::chrono::steady_clock::now();
+            CameraFeed& cam = g_cams[cam_idx];
 
-            // Find matching ActiveTrack by spatial proximity to reid_pkt.box
+            // Match to local spatial ActiveTrack on this camera by IoU/proximity
             int matched_track_idx = -1;
-            float best_match_score = 0.10f; // Minimum score threshold
+            float best_match_score = 0.10f;
 
-            for (size_t t = 0; t < g_tracks.size(); t++) {
-                float iou = compute_iou(reid_pkt.box, g_tracks[t].box);
-                float dx = reid_pkt.box.cx - g_tracks[t].box.cx;
-                float dy = reid_pkt.box.cy - g_tracks[t].box.cy;
+            for (size_t t = 0; t < cam.tracks.size(); t++) {
+                float iou = compute_iou(reid_pkt.box, cam.tracks[t].box);
+                float dx = reid_pkt.box.cx - cam.tracks[t].box.cx;
+                float dy = reid_pkt.box.cy - cam.tracks[t].box.cy;
                 float dist = std::sqrt(dx * dx + dy * dy);
                 float score = iou + (dist < 0.20f ? (0.25f - dist) : 0.0f);
                 if (score > best_match_score) {
@@ -835,24 +960,23 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
                 }
             }
 
-            // If no existing track matched reid_pkt.box, create one
             if (matched_track_idx < 0) {
                 ActiveTrack new_t = {};
-                new_t.track_id = g_next_track_id++;
+                new_t.track_id = cam.next_track_id++;
                 new_t.person_id = 0;
                 new_t.sim = 0.0f;
                 new_t.color = RGB(160, 160, 160);
                 new_t.box = reid_pkt.box;
                 new_t.last_seen = now_t;
-                g_tracks.push_back(new_t);
-                matched_track_idx = (int)g_tracks.size() - 1;
+                cam.tracks.push_back(new_t);
+                matched_track_idx = (int)cam.tracks.size() - 1;
             }
 
-            ActiveTrack& trk = g_tracks[matched_track_idx];
+            ActiveTrack& trk = cam.tracks[matched_track_idx];
             trk.box = reid_pkt.box;
             trk.last_seen = now_t;
 
-            // Pure Cosine Similarity matching against gallery profiles using dynamic threshold
+            // Match against SHARED GALLERY POOL (g_gallery) across BOTH camera streams
             float live_threshold = g_reid_similarity_threshold.load();
             int best_gallery_id = -1;
             float best_gallery_sim = -1.0f;
@@ -869,18 +993,18 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
                 snprintf(scBuf, sizeof(scBuf), "p%d:%d%%%s", g_gallery[i].id, (int)(sim * 100.0f), (i + 1 < g_gallery.size()) ? ", " : "");
                 scores_log += scBuf;
 
-                // Mutual exclusion: Ensure two active tracks don't claim the same person simultaneously
-                bool in_use_by_other = false;
-                for (size_t other_t = 0; other_t < g_tracks.size(); other_t++) {
-                    if ((int)other_t != matched_track_idx && g_tracks[other_t].person_id == g_gallery[i].id) {
-                        double age = std::chrono::duration<double>(now_t - g_tracks[other_t].last_seen).count();
-                        if (age < 1.0) { // Actively seen within last 1 second
-                            in_use_by_other = true;
+                // Intra-camera mutual exclusion: Ensure two tracks on the SAME camera feed don't claim the same person simultaneously
+                bool in_use_by_other_on_same_cam = false;
+                for (size_t other_t = 0; other_t < cam.tracks.size(); other_t++) {
+                    if ((int)other_t != matched_track_idx && cam.tracks[other_t].person_id == g_gallery[i].id) {
+                        double age = std::chrono::duration<double>(now_t - cam.tracks[other_t].last_seen).count();
+                        if (age < 1.0) {
+                            in_use_by_other_on_same_cam = true;
                             break;
                         }
                     }
                 }
-                if (in_use_by_other) continue;
+                if (in_use_by_other_on_same_cam) continue;
 
                 if (sim > best_gallery_sim) {
                     best_gallery_sim = sim;
@@ -891,7 +1015,7 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
             scores_log += "]";
 
             if (best_gallery_sim >= live_threshold && best_gallery_idx >= 0) {
-                // Match confirmed in Gallery: update gallery template feature via simple EMA
+                // Identity matched in the unified pool! Update shared gallery template feature (EMA)
                 for (size_t i = 0; i < norm_emb.size(); i++) {
                     g_gallery[best_gallery_idx].feature[i] = 0.85f * g_gallery[best_gallery_idx].feature[i] + 0.15f * norm_emb[i];
                 }
@@ -904,19 +1028,21 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
 
                 g_gallery[best_gallery_idx].match_count++;
                 g_gallery[best_gallery_idx].last_seen_frame = reid_pkt.frame_id;
-                g_gallery[best_gallery_idx].last_similarity = best_gallery_sim;
                 g_gallery[best_gallery_idx].last_seen_time = now_t;
+                g_gallery[best_gallery_idx].last_cam_id = cam.cam_id;
+                g_gallery[best_gallery_idx].last_similarity = best_gallery_sim;
 
                 trk.person_id = best_gallery_id;
                 trk.sim = best_gallery_sim;
                 trk.color = g_gallery[best_gallery_idx].color;
 
-                std::cout << "[RX REID] Track #" << trk.track_id << " (crop box " << box_idx << ") | frame #" << reid_pkt.frame_id
-                          << " " << scores_log << " ==> [MATCH] Person #" << best_gallery_id
+                std::cout << "[CROSS-CAM REID Cam #" << cam.cam_id << " (" << cam.ip << ")] Track #" << trk.track_id
+                          << " (crop box " << box_idx << ") | frame #" << reid_pkt.frame_id
+                          << " " << scores_log << " ==> [MATCH POOL] Person #" << best_gallery_id
                           << " (sim=" << (int)(best_gallery_sim * 100.0f) << "% >= "
                           << (int)(live_threshold * 100.0f) << "%)\n";
             } else {
-                // Direct new person creation without waiting or buffering
+                // Add new Person identity to the shared pool
                 int new_id = (int)g_gallery.size() + 1;
                 COLORREF color = ID_COLORS[(new_id - 1) % NUM_ID_COLORS];
                 PersonProfile p;
@@ -924,6 +1050,7 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
                 p.feature = norm_emb;
                 p.color = color;
                 p.last_seen_frame = reid_pkt.frame_id;
+                p.last_cam_id = cam.cam_id;
                 p.match_count = 1;
                 p.last_similarity = (best_gallery_sim > 0.0f) ? best_gallery_sim : 1.0f;
                 p.last_seen_time = now_t;
@@ -933,8 +1060,9 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
                 trk.sim = 1.0f;
                 trk.color = color;
 
-                std::cout << "[RX REID] Track #" << trk.track_id << " (crop box " << box_idx << ") | frame #" << reid_pkt.frame_id
-                          << " " << scores_log << " ==> [NEW PERSON #" << new_id << "] (best_sim="
+                std::cout << "[CROSS-CAM REID Cam #" << cam.cam_id << " (" << cam.ip << ")] Track #" << trk.track_id
+                          << " (crop box " << box_idx << ") | frame #" << reid_pkt.frame_id
+                          << " " << scores_log << " ==> [NEW POOL PERSON #" << new_id << "] (best_sim="
                           << (int)(best_gallery_sim * 100.0f) << "% < "
                           << (int)(live_threshold * 100.0f) << "%)\n";
             }
@@ -942,6 +1070,7 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
             g_raw_latest_embedding.assign(reid_pkt.embedding, reid_pkt.embedding + emb_len);
             g_latest_reid_box = box_idx;
             g_latest_reid_frame = reid_pkt.frame_id;
+            g_latest_reid_cam_id = cam.cam_id;
             g_reid_total_count++;
             LeaveCriticalSection(&g_cs);
 
@@ -951,21 +1080,20 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
         }
         // 2. OD Metadata Packet
         else if (pkt_type == PKT_TYPE_OD_METADATA && bytes >= (int)sizeof(OdMetadataPacket_t)) {
-            memcpy(&current_meta, recv_buf.data(), sizeof(OdMetadataPacket_t));
-
             EnterCriticalSection(&g_cs);
-            auto now_t = std::chrono::steady_clock::now();
+            CameraFeed& cam = g_cams[cam_idx];
+            memcpy(&cam.latest_meta, recv_buf.data(), sizeof(OdMetadataPacket_t));
 
-            // Update active tracks with new frame detections (greedy matching)
-            std::vector<bool> track_matched(g_tracks.size(), false);
-            for (uint8_t i = 0; i < current_meta.num_boxes; i++) {
+            // Update local spatial tracks on this camera
+            std::vector<bool> track_matched(cam.tracks.size(), false);
+            for (uint8_t i = 0; i < cam.latest_meta.num_boxes; i++) {
                 int best_t = -1;
                 float best_overlap = 0.15f;
-                for (size_t t = 0; t < g_tracks.size(); t++) {
+                for (size_t t = 0; t < cam.tracks.size(); t++) {
                     if (track_matched[t]) continue;
-                    float iou = compute_iou(current_meta.boxes[i], g_tracks[t].box);
-                    float dx = current_meta.boxes[i].cx - g_tracks[t].box.cx;
-                    float dy = current_meta.boxes[i].cy - g_tracks[t].box.cy;
+                    float iou = compute_iou(cam.latest_meta.boxes[i], cam.tracks[t].box);
+                    float dx = cam.latest_meta.boxes[i].cx - cam.tracks[t].box.cx;
+                    float dy = cam.latest_meta.boxes[i].cy - cam.tracks[t].box.cy;
                     float dist = std::sqrt(dx * dx + dy * dy);
                     float score = iou + (dist < 0.15f ? (0.20f - dist) : 0.0f);
                     if (score > best_overlap) {
@@ -974,29 +1102,28 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
                     }
                 }
                 if (best_t >= 0) {
-                    g_tracks[best_t].box = current_meta.boxes[i];
-                    g_tracks[best_t].last_seen = now_t;
+                    cam.tracks[best_t].box = cam.latest_meta.boxes[i];
+                    cam.tracks[best_t].last_seen = now_t;
                     track_matched[best_t] = true;
                 } else {
-                    // Create new active track
                     ActiveTrack new_t = {};
-                    new_t.track_id = g_next_track_id++;
+                    new_t.track_id = cam.next_track_id++;
                     new_t.person_id = 0;
                     new_t.sim = 0.0f;
                     new_t.color = RGB(160, 160, 160);
-                    new_t.box = current_meta.boxes[i];
+                    new_t.box = cam.latest_meta.boxes[i];
                     new_t.last_seen = now_t;
-                    g_tracks.push_back(new_t);
+                    cam.tracks.push_back(new_t);
                 }
             }
 
             // Prune tracks unseen for > 2.0s
-            g_tracks.erase(
-                std::remove_if(g_tracks.begin(), g_tracks.end(),
+            cam.tracks.erase(
+                std::remove_if(cam.tracks.begin(), cam.tracks.end(),
                     [&](const ActiveTrack& trk) {
                         return std::chrono::duration<double>(now_t - trk.last_seen).count() > 2.0;
                     }),
-                g_tracks.end()
+                cam.tracks.end()
             );
 
             LeaveCriticalSection(&g_cs);
@@ -1011,49 +1138,57 @@ DWORD WINAPI NetworkThread(LPVOID lpParam) {
                 int stride = (hdr.total_chunks <= 150) ? 1400 : 1024;
                 int offset = hdr.chunk_idx * stride;
 
-                if (offset + payload_len <= (int)raw_frame_rgb.size()) {
-                    memcpy(raw_frame_rgb.data() + offset,
+                EnterCriticalSection(&g_cs);
+                CameraFeed& cam = g_cams[cam_idx];
+
+                if (cam.raw_frame_rgb.size() != FRAME_W * FRAME_H * 3) {
+                    cam.raw_frame_rgb.assign(FRAME_W * FRAME_H * 3, 0);
+                }
+                if (cam.rgb32_buffer.size() != FRAME_W * FRAME_H) {
+                    cam.rgb32_buffer.assign(FRAME_W * FRAME_H, 0);
+                }
+
+                if (offset + payload_len <= (int)cam.raw_frame_rgb.size()) {
+                    memcpy(cam.raw_frame_rgb.data() + offset,
                            recv_buf.data() + sizeof(VideoChunkHeader_t),
                            payload_len);
                 }
 
-                if (hdr.frame_id != active_frame_id) {
-                    active_frame_id = hdr.frame_id;
-                    chunks_received = 0;
+                if (hdr.frame_id != cam.active_frame_id) {
+                    cam.active_frame_id = hdr.frame_id;
+                    cam.chunks_received = 0;
                 }
-                chunks_received++;
+                cam.chunks_received++;
 
                 // Frame complete or last chunk received
-                if (chunks_received >= hdr.total_chunks || hdr.chunk_idx == hdr.total_chunks - 1) {
-                    EnterCriticalSection(&g_cs);
-                    const uint8_t* pRgb = raw_frame_rgb.data();
+                if (cam.chunks_received >= hdr.total_chunks || hdr.chunk_idx == hdr.total_chunks - 1) {
+                    const uint8_t* pRgb = cam.raw_frame_rgb.data();
                     for (int i = 0; i < FRAME_W * FRAME_H; i++) {
                         uint8_t r = pRgb[i * 3 + 0];
                         uint8_t g = pRgb[i * 3 + 1];
                         uint8_t b = pRgb[i * 3 + 2];
-                        g_rgb32_buffer[i] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+                        cam.rgb32_buffer[i] = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
                     }
-                    g_latest_meta = current_meta;
-                    g_current_frame_id = hdr.frame_id;
-                    g_has_frame = true;
+                    cam.current_frame_id = hdr.frame_id;
+                    cam.has_frame = true;
+
+                    // Compute FPS per camera
+                    cam.frame_count++;
+                    auto now = std::chrono::steady_clock::now();
+                    double elapsed = std::chrono::duration<double>(now - cam.fps_start).count();
+                    if (elapsed >= 1.0) {
+                        cam.stream_fps = cam.frame_count / elapsed;
+                        cam.frame_count = 0;
+                        cam.fps_start = now;
+                    }
+
                     LeaveCriticalSection(&g_cs);
 
-                    // Compute FPS
-                    frame_count++;
-                    auto now = std::chrono::steady_clock::now();
-                    double elapsed = std::chrono::duration<double>(now - fps_start).count();
-                    if (elapsed >= 1.0) {
-                        EnterCriticalSection(&g_cs);
-                        g_stream_fps = frame_count / elapsed;
-                        LeaveCriticalSection(&g_cs);
-                        frame_count = 0;
-                        fps_start = now;
-                    }
-
-                    // Trigger Repaint
                     if (g_hwnd) {
                         InvalidateRect(g_hwnd, NULL, FALSE);
                     }
+                } else {
+                    LeaveCriticalSection(&g_cs);
                 }
             }
         }
@@ -1079,7 +1214,7 @@ int main() {
     wc.cbSize = sizeof(WNDCLASSEXA);
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
-    wc.lpszClassName = "STM32N6_ReID_Viewer_Class";
+    wc.lpszClassName = "STM32N6_DualCam_Viewer_Class";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
 
@@ -1088,14 +1223,14 @@ int main() {
         return 1;
     }
 
-    // Window size: 832x548 (512x512 Video + 320px Sidebar + 36px Top Banner)
+    // Window size: 1344x548 (512+512 Dual Video Split Screen + 320px Sidebar + 36px Top Banner)
     RECT wr = {0, 0, TOTAL_W, TOTAL_H};
     AdjustWindowRect(&wr, WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, FALSE);
 
     g_hwnd = CreateWindowExA(
         0,
-        "STM32N6_ReID_Viewer_Class",
-        "STM32N6 Object Detection & ReID Real-Time Viewer",
+        "STM32N6_DualCam_Viewer_Class",
+        "STM32N6 Dual-Camera Split-Screen ReID Real-Time Viewer",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT,
         wr.right - wr.left, wr.bottom - wr.top,
@@ -1111,7 +1246,7 @@ int main() {
     UpdateWindow(g_hwnd);
 
     std::cout << "[+] Window created successfully.\n";
-    std::cout << "    [R]     Reset ReID Gallery\n";
+    std::cout << "    [R]     Reset Shared ReID Gallery & Camera Tracks\n";
     std::cout << "    [ESC/Q] Exit Application\n";
 
     // Win32 Message Loop
