@@ -82,10 +82,6 @@ The embedded boards communicate over the `192.168.1.0/24` subnet. Configure your
 
 #### PowerShell Setup Command (Run as Administrator):
 ```powershell
-# Identify your Ethernet interface name (e.g., "Ethernet" or "Ethernet 2")
-Get-NetAdapter
-
-# Apply the static IP (replace "Ethernet" with your adapter name if different)
 New-NetIPAddress -InterfaceAlias "Ethernet" -IPAddress 192.168.1.100 -PrefixLength 24
 ```
 
@@ -108,7 +104,7 @@ The central tracking and multi-camera display server is hosted in its dedicated 
    ```cmd
    build_and_run.bat
    ```
-   *Alternatively, if running the precompiled executable directly:*
+   *Alternatively, run the precompiled executable directly:*
    ```cmd
    Project-Argus-Server.exe
    ```
@@ -116,7 +112,19 @@ The central tracking and multi-camera display server is hosted in its dedicated 
 
 ---
 
-### Step 2: Configure STM32 Hardware Boot Switches (Debug Mode)
+### Step 2: Flash the AI Models (STM32CubeProgrammer)
+
+Use **STM32CubeProgrammer** to program the neural network models to the external flash:
+
+1. Open **STM32CubeProgrammer** and click **Connect**.
+2. Select and enable the **External Memory Loader** for the board: `MX66UW1G45G_STM32N6570-DK`.
+3. In the **Erasing & Programming** tab, browse and select the model HEX/bin file, enter the respective address, and click **Start Programming**:
+   - **Object Detection Model**: `0x71000000`
+   - **Feature Extraction (ReID) Model**: `0x71400000`
+
+---
+
+### Step 3: Configure STM32 Hardware Boot Switches (Debug Mode)
 
 Before connecting the boards, ensure the boot switches are configured in **Development / Debug Mode**:
 - Set both boot switch positions (**BOOT0** and **BOOT1**) to **0 / Development Boot Mode**.
@@ -124,7 +132,7 @@ Before connecting the boards, ensure the boot switches are configured in **Devel
 
 ---
 
-### Step 3: Open and Run Firmware via STM32CubeIDE
+### Step 4: Open and Run Firmware via STM32CubeIDE
 
 1. Clone the Project Argus firmware repository:
    ```cmd
