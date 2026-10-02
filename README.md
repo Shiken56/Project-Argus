@@ -7,57 +7,37 @@
 
 ---
 
-## 1. Executive Summary & Real-World Significance
+## 1. About
 
-Traditional multi-camera video surveillance and analytics architectures suffer from two fundamental bottlenecks: **extreme network bandwidth consumption** and **centralized server compute saturation**. Streaming raw 1080p/4K video feeds from dozens or hundreds of cameras to a cloud server introduces severe latency, incurs massive cloud infrastructure costs, and introduces significant privacy vulnerabilities.
+**Project Argus** is a distributed, multi-camera spatial intelligence system that moves deep learning directly to the extreme edge. Running on ultra-low-power **STM32N6570-DK** microcontrollers, each camera node captures video, detects objects, and extracts deep feature embeddings locally in real time. 
 
-**Project Argus** overcomes these challenges by executing **distributed, real-time Edge AI vision pipelines directly on ultra-low-power microcontrollers**:
-- **Zero Raw-Video Latency & Zero Cloud Dependent Compute**: Deep neural network inference is computed locally on the camera nodes in real time.
-- **Privacy by Design**: Video processing happens entirely on-device; only processed visual chunks, bounding box detections, and high-dimensional feature embeddings are transmitted.
-- **Low Power & Industrial Scalability**: Built on the STMicroelectronics STM32N6 series powered by an Arm Cortex-M55 core and the hardware **Neural-ART NPU**, delivering high-throughput inference at milliwatt power budgets.
+By performing complete vision inference on-device, Project Argus eliminates cloud bandwidth bottlenecks, removes cloud compute costs, provides zero-latency alerts, and guarantees privacy by design—streaming only lightweight detections and feature vectors rather than sensitive raw video feeds.
+
+<p align="center">
+  <img src="assets/overall_proj.png" alt="Project Argus System Overview" width="850">
+</p>
 
 ### Key Capabilities
-- **On-Device Object Detection**: Real-time person and object localization directly from MIPI-CSI2 sensor frames.
-- **Deep Feature Extraction (ReID Embeddings)**: Running specialized feature extraction networks on the integrated NPU to compute distinct appearance descriptors for spatial multi-camera re-identification.
-- **Hard Real-Time Determinism with μT-Kernel 3.0**: Leveraging the TRON Forum microT-Kernel 3.0 RTOS to guarantee zero frame dropping across preemptive camera capture (DCMIPP), NPU execution, and network transmission.
+
+1. **Hard Real-Time System with TRON μT-Kernel 3.0**:
+   - Built on the microT-Kernel 3.0 (`mtk3_bsp2`) RTOS compliant with TRON Forum standards.
+   - Provides deterministic, preemptive scheduling to guarantee zero frame dropping across MIPI-CSI2 acquisition, DMA transfers, NPU execution, and high-speed network transmission.
+
+2. **Deep Feature Extraction (ReID Embeddings)**:
+   - Executes specialized feature extraction neural networks on the integrated **Neural-ART NPU**.
+   - Generates compact, high-dimensional appearance descriptors for real-time person re-identification across non-overlapping camera fields of view.
+
+3. **On-Device Object Detection**:
+   - Performs real-time target and person localization directly on sensor frames captured by the MIPI-CSI2 camera and DCMIPP ISP pipeline.
 
 ---
 
 ## 2. System Architecture
 
-```
-  +-------------------------------------------------------------------------------+
-  |                        STM32N6570-DK Edge Vision Node                         |
-  |                                                                               |
-  |  +----------------+    MIPI-CSI2    +------------------+    AXI DMA           |
-  |  |  Camera Module | --------------> |   CSI-2 Host     | -------------\       |
-  |  |  (IMX335/OV56) |                 |    + DCMIPP      |              |       |
-  |  +----------------+                 +------------------+              v       |
-  |                                                                +------------+ |
-  |  +----------------------------------------------------------+  | HyperRAM / | |
-  |  |                 microT-Kernel 3.0 (TRON)                 |  | AXISRAM    | |
-  |  |  - Sensor Acquisition Task                               |  +------------+ |
-  |  |  - Deep Learning Pipeline:                               |         |       |
-  |  |    * Mobile Object Detection                             |         |       |
-  |  |    * ReID Feature Extraction (Neural-ART NPU)            | <-------/       |
-  |  |  - LwIP Network Streaming & Telemetry Task               |                 |
-  |  +----------------------------------------------------------+                 |
-  |                               |                                               |
-  +-------------------------------|-----------------------------------------------+
-                                  | Ethernet (LwIP UDP)
-                                  v
-  +-------------------------------------------------------------------------------+
-  |                        High-Speed Local Ethernet Switch                       |
-  |            [Port 1: Board 1]      [Port 2: Board 2]      [Port 3: Host PC]    |
-  +-------------------------------------------------------------------------------+
-                                                             |
-                                                             v
-  +-------------------------------------------------------------------------------+
-  |                 Central Aggregator: Project Argus Server                      |
-  |  - Multi-Camera Frame Ingestion & High-Performance Rendering                  |
-  |  - Real-Time Cross-Camera Feature Matching & Spatial Tracking Display         |
-  +-------------------------------------------------------------------------------+
-```
+<p align="center">
+  <img src="assets/hld_proj.png" alt="Project Argus High Level Design Architecture" width="850">
+</p>
+
 
 ---
 
@@ -114,7 +94,7 @@ The central tracking and multi-camera display server is hosted in its dedicated 
 
 ### Step 2: Flash the AI Models (STM32CubeProgrammer)
 
-Use **STM32CubeProgrammer** to program the neural network models to the external flash:
+Use **STM32CubeProgrammer** to program the neural network models to external flash:
 
 1. Open **STM32CubeProgrammer** and click **Connect**.
 2. Select and enable the **External Memory Loader** for the board: `MX66UW1G45G_STM32N6570-DK`.
