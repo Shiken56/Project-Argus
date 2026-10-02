@@ -14,7 +14,7 @@
 By performing complete vision inference on-device, Project Argus eliminates cloud bandwidth bottlenecks, removes cloud compute costs, provides zero-latency alerts, and guarantees privacy by design—streaming only lightweight detections and feature vectors rather than sensitive raw video feeds.
 
 <p align="center">
-  <img src="assets/overall_proj.png" alt="Project Argus System Overview" width="850">
+  <img src="assets/overall_proj.png" alt="Project Argus System Overview" width="680">
 </p>
 
 ### Key Capabilities
@@ -35,7 +35,7 @@ By performing complete vision inference on-device, Project Argus eliminates clou
 ## 2. System Architecture
 
 <p align="center">
-  <img src="assets/hld_proj.png" alt="Project Argus High Level Design Architecture" width="850">
+  <img src="assets/hld_proj.png" alt="Project Argus High Level Design Architecture" width="680">
 </p>
 
 
