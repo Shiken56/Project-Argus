@@ -43,85 +43,9 @@ By performing complete vision inference on-device, Project Argus eliminates clou
 
 ### TRON RTOS Task Pipeline Architecture
 
-```mermaid
-flowchart RL
-    classDef taskBox fill:#f0fdf4,stroke:#16a34a,stroke-width:2.5px,color:#14532d;
-    classDef innerStep fill:#ffffff,stroke:#0284c7,stroke-width:1.5px,color:#0369a1;
-    classDef hwBox fill:#fff7ed,stroke:#ea580c,stroke-width:2px,color:#9a3412;
-    classDef ipcBox fill:#fdf4ff,stroke:#c026d3,stroke-width:2px,color:#701a75;
-    classDef serverBox fill:#ede9fe,stroke:#7c3aed,stroke-width:2.5px,color:#4c1d95;
-
-    SERVER["Central Server<br/>(Project Argus Display & Tracking)<br/>• Real-time Stream Viewer<br/>• Cosine Similarity Re-ID Matching"]
-
-    subgraph TASK_NET ["network_task"]
-        direction TB
-        NET_1["1. Ingest Data Packets<br/>• ml_buffer (Camera Frames)<br/>• Bounding Box Coordinates<br/>• 128-d ReID Embeddings"]
-        NET_2["2. LwIP UDP Packetizer<br/>• Prepend 'TRON' Magic (0x54524F4E)<br/>• Zero-Copy pbuf Allocation<br/>• tk_dly_tsk() Cooperative Yield"]
-        NET_3["3. Gigabit Ethernet Peripheral<br/>• Non-Cacheable DMA Ring (0x341F0000)<br/>• Broadcast / Unicast over Port 5000"]
-        NET_1 --> NET_2 --> NET_3
-    end
-
-    subgraph TASK_REID ["reid_task (fx_task)"]
-        direction TB
-        REID_1["1. Read Person Crop<br/>(reid_input_buf via Mailbox)"]
-        REID_2["2. Acquire sem_npu Lock<br/>(Wait for NPU Hardware Free)"]
-        REID_3["3. Run OSNet Model<br/>nnlib_run_inference()"]
-        REID_4["4. Release sem_npu Lock<br/>& Output 128-d int8 Embedding"]
-        REID_1 --> REID_2 --> REID_3 --> REID_4
-    end
-
-    subgraph SHARED_AI ["Shared AI Engine"]
-        direction TB
-        FLASH_MODELS[("Octo-SPI Flash<br/>• OD Weights @ 0x71000000<br/>• ReID Weights @ 0x71400000")]
-        NPU_CORE["Neural-ART NPU<br/>Hardware Accelerator<br/>[sem_npu Mutex Protected]"]
-        FLASH_MODELS -->|"Static INT8 Weights"| NPU_CORE
-    end
-
-    MBX_QUEUE[["RTOS Mailbox Queue<br/>(mbx_od_to_fx)<br/>Person Crop Jobs"]]
-
-    subgraph TASK_OD ["od_task"]
-        direction TB
-        OD_1["1. Lock ml_buffer<br/>(256x256 Input Frame)"]
-        OD_2["2. Acquire sem_npu Lock<br/>(Wait for NPU Hardware Free)"]
-        OD_3["3. Run Mobile YOLO Model<br/>nnlib_run_inference()"]
-        OD_4["4. Release sem_npu Lock<br/>& Execute NMS Algorithm"]
-        OD_5["5. Extract Person Crops<br/>(Store in reid_input_buf)"]
-        OD_1 --> OD_2 --> OD_3 --> OD_4 --> OD_5
-    end
-
-    SEM_FRAME{{"Binary Semaphore<br/>(sem_od_frame_ready)<br/>Signals Frame Ready"}}
-
-    subgraph TASK_CAM ["cam_task"]
-        direction TB
-        CAM_1["1. Camera Sensor<br/>(MIPI-CSI2 Interface)"]
-        CAM_2["2. DCMIPP ISP Hardware<br/>CameraPipeline_NNPipe_Start()<br/>CameraPipeline_DisplayPipe_Start()"]
-        CAM_3["3. Direct DMA Transfer<br/>• ml_buffer (256x256x3) -> Internal SRAM<br/>• display_buffer (800x480) -> PSRAM"]
-        CAM_4["4. Frame Event Callback ISR<br/>CMW_CAMERA_PIPE_FrameEventCallback()"]
-        CAM_1 --> CAM_2 --> CAM_3 --> CAM_4
-    end
-
-    CAM_4 -->|"tk_sig_sem()"| SEM_FRAME
-    SEM_FRAME -->|"tk_wai_sem() Wakes Up"| OD_1
-
-    OD_3 <-->|"Execute YOLO Inference"| NPU_CORE
-
-    OD_5 -->|"tk_snd_mbx() Post Crop"| MBX_QUEUE
-    MBX_QUEUE -->|"tk_rcv_mbx() Pop Crop"| REID_1
-
-    REID_3 <-->|"Execute OSNet Inference"| NPU_CORE
-
-    OD_4 -->|"Bounding Boxes"| NET_1
-    REID_4 -->|"128-d Embeddings"| NET_1
-    CAM_3 -.->|"Video Chunks"| NET_1
-
-    NET_3 ==>|"LwIP UDP Datagrams<br/>(Port 5000)"| SERVER
-
-    class TASK_CAM,TASK_OD,TASK_REID,TASK_NET taskBox;
-    class CAM_1,CAM_2,CAM_3,CAM_4,OD_1,OD_2,OD_3,OD_4,OD_5,REID_1,REID_2,REID_3,REID_4,NET_1,NET_2,NET_3 innerStep;
-    class NPU_CORE,FLASH_MODELS hwBox;
-    class SEM_FRAME,MBX_QUEUE ipcBox;
-    class SERVER serverBox;
-```
+<p align="center">
+  <img src="assets/TRON%20Detailed%20RTOS%20dig.jpg" alt="TRON RTOS Task Pipeline Architecture" width="680">
+</p>
 
 ---
 
