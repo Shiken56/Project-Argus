@@ -23,6 +23,8 @@
 *.elf
 *.bin
 *.hex
+!models/
+!models/*.hex
 *.axf
 *.srec
 *.out
